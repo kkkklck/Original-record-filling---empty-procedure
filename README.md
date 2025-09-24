@@ -1,72 +1,72 @@
-# Original-record-filling---empty-procedure
-面向检测机构的原始记录自动填写定制软件（闭源/商用授权）。从 Word 原始表自动抽取数据，生成汇总 Word，并按“钢柱/钢梁/支撑/网架”分类写入标准化 Excel 模板；支持 μ 值智能分流（≥4 位或≥1000 判 μ）、楼层/编号分桶、日期切片、页池自动复制与对齐保真。已登记版权，不提供源码；如需试用/定制/购买，请联系作者（支持按站点/年维保/一次性买断）。
+# Original Record Auto-Filling Suite
 
-原始记录自动填写程序 · 定制商用版
-闭源 | 版权已登记 | 按需定制/付费授权
+**Proprietary commercial software for structural fireproofing inspections.**
 
-这是什么？
-为钢结构类检测场景打造的自动制表引擎：读取 Word 原始表 → 生成汇总 Word → 分类分页写入 Excel 模板，整套流程一键跑通，格式与版式严格对齐，适配一线检测所的出表规范。核心能力基于内部脚本《原始记录自动填写程序.py》。
+The Original Record Auto-Filling Suite streamlines how inspection agencies compile fireproofing records for steel columns, beams, braces, and space frames. Starting from Word-based raw reports, the suite extracts measurements, generates a consolidated Word summary, and writes normalized Excel deliverables that are ready for review and printing. The underlying automation script (`原始记录自动填写程序.py`) is offered only under commercial license.
 
-核心能力
-Word → 结构化抽取：自动识别含「测点1/平均值」的表，容错各种列合并与缺列；生成《汇总原始记录.docx》，表头高亮、行数自动补齐。
-Excel 批量出表：克隆模板页保留打印区域/页边距/缩放/冻结窗格/行列宽等；按块写入并保留原对齐。
-分类与排序：钢柱/钢梁/支撑/网架（含同义词）；楼层排序规则：B* → 数字层↑ → 机房层 → 屋面。
-μ 值智能分流：任一读数出现“≥4 位连续数字”或“绝对值 ≥1000”的纯数值即判 μ；同桶普通在前、μ 在后，页码连续，不混页。
-页池管理：仅在需要时复制页；μ 页与普通页共用编号序列；未用 μ 模板页自动清理。
-字体与对齐：含 “μ” 的单元格强制 Times New Roman，其他字号/加粗/对齐不变。
-稳定人机交互：流程化向导、进度输出、文件占用友好提示；失败可安全回到路径输入。
+> **Closed-source / license required.** Copyright registered. Source code is not distributed.
 
-工作模式（内置 4 种）
-按日期分桶（默认稳健）：一组日期自动分配全部构件，可选择“后面的日期优先/前面的日期优先”。
-按楼层断点：设置断点（如 3/6/机房/屋面）→ 每个段映射到指定日期。
-单日模式：全量数据同日出表，快速交付。
-楼层 × 日期 切片：同一楼层跨多日均分或设配额。
-支撑/网架均可按编号或楼层参与分桶；网架子类支持范围白名单。
+## Highlights
+- **Word-to-structure extraction** – Detects tables that include entries such as “测点1 / 平均值”, tolerates merged or missing columns, and outputs a highlighted summary document with consistent row counts.
+- **Excel batch publishing** – Clones template sheets while preserving print areas, margins, zoom, frozen panes, and cell sizing, then writes data in-place with layout fidelity.
+- **Smart categorization & sorting** – Automatically classifies by steel column, beam, brace, and space frame (with synonyms). Floors are ordered `B* → numerical → equipment → roof`.
+- **μ-value routing** – Flags a row as μ when any reading contains four or more consecutive digits or an absolute value ≥ 1000. Normal and μ pages share a continuous numbering scheme without mixing pages.
+- **Dynamic page pooling** – Copies template sheets only when necessary, keeps numbering aligned between normal and μ pages, and removes unused μ templates.
+- **Typography enforcement** – Ensures cells containing “μ” use Times New Roman while keeping all other styles intact.
+- **Operator-friendly experience** – Guided workflow with progress feedback, safe recovery when files are locked, and clear prompts throughout the process.
 
-适用场景
-钢柱/钢梁/支撑/网架类防火厚度或相近结构检测的批量原始记录归档与报表输出。
-需要“一键汇总 + 合规版式 + 打印即交”的检测机构与第三方实验室。
+## Built-in Operating Modes
+1. **Date buckets (default)** – Distributes components across dates with a choice of front-loaded or back-loaded prioritization.
+2. **Floor breakpoints** – Map custom floor ranges (e.g., 3/6/equipment/roof) to specific dates.
+3. **Single-day** – Produce all deliverables under one inspection date for rapid submission.
+4. **Floor × date slicing** – Share a floor across multiple dates evenly or by quota.
 
-环境要求
-Windows 10/11，Microsoft Excel（用于查看与打印）。
-Python 3.9+（运行版），依赖：python-docx、openpyxl（演示包内置）。
-Excel 模板需包含基础页（如“钢柱/钢梁/支撑/网架”）与对应 μ 模板页（如“钢梁μ”）。
+Braces and space frames can be grouped by identifier or floor; space-frame subtypes support whitelist constraints.
 
-快速了解与试用
-本仓库不公开源码。如需演示版/试用：
-提交需求（结构类型、模板样例、目标版式）；
-我方远程演示或提供脱敏 Demo；
-确认范围与 SLA 后签订协议；
-交付加密可执行/受控脚本与模板；
-培训与验收，进入维保周期。
+## Applicable Scenarios
+- Bulk record keeping and report generation for structural fireproofing or similar inspections covering steel columns, beams, braces, and space frames.
+- Agencies that require one-click consolidation with regulation-compliant formatting and print-ready output.
 
-商业授权与定制
-授权方式：站点授权 / 年度维保 / 一次性买断（含源模板、二开接口、优先响应）。
-交付内容：可执行程序（或受控脚本）、模板与示例、使用手册、上线指导。
-服务：模板适配、字段映射、流程微调、二次规则（编号/楼层/日期策略）、内部部署。
-价格：面议（按功能与工期核价，支持里程碑付款）。
+## System Requirements
+- Windows 10 or 11 workstations for operation and printing.
+- Python 3.9+ runtime with `python-docx` and `openpyxl` dependencies (included in demo builds).
+- Excel templates that contain base sheets (e.g., "钢柱", "钢梁", "支撑", "网架") and the corresponding μ variants (e.g., "钢梁μ").
 
-版权说明：本软件受《著作权法》保护，禁止传播/反编译/转授权。如需二开或接口合作，可在合同中约定。
+## Engagement & Evaluation
+This repository does not include source code. To request a demo or trial:
+1. Share your target structures, template samples, and required layout.
+2. Receive a remote walkthrough or sanitized demo package.
+3. Finalize scope and SLA; sign the commercial agreement.
+4. Receive the protected executable/script bundle and aligned templates.
+5. Complete training, acceptance, and transition into maintenance.
 
-常见问答（精简）
-能否支持更多分类或字段？ 可以，走定制化映射。
-μ 判定能改吗？ 可按项目定阈值/正则/单位。
-模板必须固定吗？ 版式可适配，但需提供最终打印模板。
-能在无 Office 的环境运行吗？ 生成与写入不依赖 Word/Excel 进程，但查看/打印建议安装 Office。
+## Licensing & Services
+- **License models** – Per-site license, annual maintenance, or one-time buyout (includes template assets, secondary-development hooks, and priority support).
+- **Deliverables** – Executable (or controlled script), templates and samples, user manual, and go-live assistance.
+- **Professional services** – Template adaptation, field mapping, process adjustments, custom rules (ID/floor/date logic), and on-premise deployment.
+- **Pricing** – Quoted based on feature scope and delivery schedule; milestone-based payment supported.
 
-路线图
-自定义字段校验与异常高亮
-更细的编号/楼层排序钩子
-图形化向导与日志留痕
-多语言界面（中/英）
+> The software is protected under copyright law. Redistribution, reverse engineering, or sublicense without written consent is prohibited. Interface extensions can be negotiated contractually.
 
-版本
-v1.0.1：稳定版（分页与 μ 分流逻辑强化；模板克隆保留打印与缩放；对齐/字体保真；进度条与容错）
+## FAQ (Condensed)
+- **Can additional categories or fields be supported?** Yes, through customized mapping.
+- **Can the μ-detection logic be adjusted?** Thresholds, patterns, and units are configurable per project.
+- **Is a fixed template required?** Layouts are adaptable, but a final print template must be provided.
+- **Does the workflow require Microsoft Office?** Generation does not rely on Word/Excel processes, but Office is recommended for review and printing.
 
-联系方式
-邮箱：<kkkklck@qq.com>
-微信：wunailck
-或直接在 Issues 留言说明用途与单位信息（不会公开源码，仅用于商务沟通）。
+## Roadmap
+- Custom field validation with anomaly highlighting.
+- Finer-grained hooks for floor and identifier sorting.
+- Graphical wizard with audit logging.
+- Bilingual (Chinese/English) interface options.
 
-法律与合规
-本仓库仅用于产品介绍与商务对接。除非获得书面授权，不得用于逆向、竞品训练或任何形式的复制与传播。违者依法追责。
+## Release Notes
+- **v1.0.1** – Stable release featuring enhanced pagination and μ-routing, template cloning with preserved print/zoom settings, typography fidelity, and guided progress indicators.
+
+## Contact
+- **Email** – <kkkklck@qq.com>
+- **WeChat** – `wunailck`
+- Or open an issue describing your organization and intended use (source code will not be provided; issues are handled for business communication only).
+
+## Legal Notice
+This repository is solely for product information and business coordination. Any reverse engineering, competitive training, or replication without written authorization is forbidden and will trigger legal action.
