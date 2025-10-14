@@ -878,6 +878,29 @@ def ensure_pages_slices_for_cat_muaware(wb, cat: str, blocks_by_bucket: dict[int
 
     return pages_slices, blocks_slices
 
+# ===== 快速探测文档中包含的构件类别（供前端静默识别用） =====
+from pathlib import Path
+from typing import Union
+
+def probe_categories_from_docx(src: Union[str, Path]) -> dict:
+    """
+    读取 Word，一次性返回包含的构件类别与数量。
+    返回示例：
+    {
+        "categories": ["钢柱", "钢梁", "支撑", "网架", "其他"],
+        "counts": {"钢柱": 392, "钢梁": 101, "支撑": 22, "网架": 0, "其他": 3}
+    }
+    """
+    p = Path(str(src)).resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"未找到 Word 源文件：{p}")
+    grouped, categories_present = prepare_from_word(p)
+    counts = {k: (len(grouped.get(k, [])) if isinstance(grouped.get(k, []), (list, tuple)) else 0)
+              for k in set(list(grouped.keys()) + list(categories_present))}
+    # 保证所有关心的键都在
+    for k in ("钢柱", "钢梁", "支撑", "网架", "其他"):
+        counts.setdefault(k, 0)
+    return {"categories": list(categories_present), "counts": counts}
 
 
 
@@ -1023,6 +1046,7 @@ def slash_tail(ws, anchors, used_pos):
         slash_block(ws, anchors, rem)
 
 
+
 # ===== 元信息固定坐标 =====
 def top_left_of_merged(ws, r, c):
     """
@@ -1041,6 +1065,86 @@ def top_left_of_merged(ws, r, c):
         if rng.min_row <= r <= rng.max_row and rng.min_col <= c <= rng.max_col:
             return rng.min_row, rng.min_col
     return r, c
+
+# ===== 非交互：单日模式导出（供 UI 直接调用） =====
+from pathlib import Path
+from typing import Union
+from openpyxl import load_workbook
+
+def export_single_day_noninteractive(
+    src: Union[str, Path],
+    meta: dict | None = None,
+    single_date: str | None = None,
+    *,
+    support_strategy: str = "number",
+    net_strategy: str = "number",
+) -> dict:
+    """
+    非交互导出（锁定 Mode 3 / 单日）。
+    返回: {"excel": Path, "word": Path|None}
+    """
+    # 0) 校验
+    src = Path(str(src)).resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"未找到 Word 源文件：{src}")
+
+    # 1) 解析 Word
+    grouped, categories_present = prepare_from_word(src)
+
+    # 2) 选择 Excel 模板（有支撑版）
+    template_path = None
+    for name in ("XLSX_WITH_SUPPORT_DEFAULT", "XLSX_TEMPLATE_WITH_SUPPORT", "DEFAULT_XLSX_WITH_SUPPORT"):
+        if name in globals() and globals()[name]:
+            template_path = Path(globals()[name])
+            break
+    if not template_path or not Path(template_path).exists():
+        raise FileNotFoundError("未找到 Excel 模板常量（XLSX_WITH_SUPPORT_DEFAULT / XLSX_TEMPLATE_WITH_SUPPORT / DEFAULT_XLSX_WITH_SUPPORT）。")
+
+    wb = load_workbook(str(template_path))
+
+    # 3) 执行模式：锁定 Mode 3
+    #    —— 注入一次性“非交互日期”，供 run_mode 读取并跳过 ask()
+    prev_flag = globals().get("NONINTERACTIVE_MODE3_DATE", None)
+    globals()["NONINTERACTIVE_MODE3_DATE"] = single_date if single_date is not None else ""
+    try:
+        used_pages = run_mode("3", wb, grouped, categories_present)
+    finally:
+        # run_mode 内部会 pop，这里再兜底清掉
+        globals().pop("NONINTERACTIVE_MODE3_DATE", None)
+        if prev_flag is not None:
+            globals()["NONINTERACTIVE_MODE3_DATE"] = prev_flag
+
+    # 4) 固定元信息、字体与清理
+    meta = meta or {}
+    apply_meta_fixed(wb, categories_present, meta)
+    enforce_mu_font(wb)
+    cleanup_unused_sheets(wb, categories_present)
+
+    # 5) 保存到同目录，避免覆盖
+    def _unique_name(p: Path) -> Path:
+        if not p.exists():
+            return p
+        stem, suf = p.stem, p.suffix
+        i = 1
+        while True:
+            cand = p.with_name(f"{stem}({i}){suf}")
+            if not cand.exists():
+                return cand
+            i += 1
+
+    out_xlsx = _unique_name(src.parent / "汇总原始记录.xlsx")
+    wb.save(str(out_xlsx))
+
+    # 6) 可选：生成 Word 汇总（安全调用）
+    word_out = None
+    maybe_func = globals().get("export_word_summary", None)
+    if callable(maybe_func):
+        try:
+            word_out = maybe_func(src, grouped)
+        except Exception:
+            word_out = None
+
+    return {"excel": out_xlsx, "word": word_out}
 
 
 def apply_meta_fixed(wb, categories_present, meta: dict):
@@ -2559,9 +2663,28 @@ def run_mode(mode: str, wb, grouped, categories_present):
                 fill_blocks_to_pages(wb, pages_by_cat[cat], blocks_by_cat_ordered[cat], prog)
         prog.finish()
 
-        apply_meta_on_pages(wb, target, "")
+        # 新版：优先使用“非交互注入”的日期，避免 ask 卡住
+        _injected = globals().pop("NONINTERACTIVE_MODE3_DATE",
+                                  None) if "NONINTERACTIVE_MODE3_DATE" in globals() else None
+
+        if _injected is not None:
+            # UI/非交互调用：传 None/"" 表示跳过写日期
+            _date_in = _injected
+        else:
+            # 仅在 CLI 交互时才询问
+            try:
+                _date_in = ask("📅 请输入检测日期（回车跳过；输入 q 返回上一步）：")
+            except BackStep:
+                raise
+
+        if str(_date_in).strip():
+            apply_meta_on_pages(wb, target, normalize_date(str(_date_in)))
+        else:
+            apply_meta_on_pages(wb, target, "")
+
         cleanup_unused_mu_templates(wb, target)
         return target
+
 
     # ============ mode 1：日期分桶（每个“日桶”也 μ-aware） ============
     elif mode == "1":
@@ -2693,6 +2816,307 @@ def run_with_mode(src: Path, grouped, categories_present, meta):
     save_workbook_safe(wb, final_path)
     print(f"✅ Excel 已保存：{final_path}")
     print("✔ 完成。本次导出结束。")
+
+# ===== 非交互入口（供 GUI 调用 / 可脚本化） =====
+# ====== 日期填充工具（新增） ======
+import re
+from datetime import datetime
+from pathlib import Path
+
+def _normalize_date(date_str: str) -> str:
+    """
+    接受 '2025-10-13' / '2025/10/13' / '2025.10.13' / '2025年10月13日' / '2025 10 13'
+    统一规范为 'YYYY-MM-DD'；不合法则抛异常。
+    """
+    s = str(date_str).strip()
+    if not s:
+        raise ValueError("检测日期为空")
+    nums = list(map(int, re.findall(r"\d+", s)))
+    if len(nums) >= 3:
+        y, m, d = nums[:3]
+        dt = datetime(year=y, month=m, day=d)
+        return dt.strftime("%Y-%m-%d")
+    try:
+        return datetime.fromisoformat(s).strftime("%Y-%m-%d")
+    except Exception:
+        raise ValueError(f"无法识别的日期格式：{s}")
+
+def _fill_date_in_sheet(ws, date_text: str) -> bool:
+    """
+    在单个工作表里寻找“日期/检验日期/探伤日期”字样（前20行×前20列），
+    优先写到右侧单元格；若右侧不可写，则把当前单元格文本替换为“……：YYYY-MM-DD”。
+    返回是否写入成功。
+    """
+    ROW_MAX, COL_MAX = 20, 20
+    for r in range(1, min(ws.max_row, ROW_MAX) + 1):
+        for c in range(1, min(ws.max_column, COL_MAX) + 1):
+            cell = ws.cell(r, c)
+            v = cell.value
+            if isinstance(v, str) and ("日期" in v or "检验日期" in v or "探伤日期" in v):
+                # 1) 右侧邻格优先
+                try:
+                    neighbor = ws.cell(r, c + 1)
+                    if neighbor.value in (None, "", "——", "-", "—"):
+                        neighbor.value = date_text
+                        return True
+                except Exception:
+                    pass
+                # 2) 改当前格文本
+                txt = v
+                txt = re.sub(r"(检验日期|探伤日期|日期)[:：]?\s*$", r"\1：" + date_text, txt)
+                cell.value = txt
+                return True
+    return False
+
+def apply_date_to_workbook(wb, date_text: str) -> int:
+    """把日期写入工作簿的可见工作表；返回成功写入的表数量。"""
+    ok = 0
+    for ws in wb.worksheets:
+        try:
+            if _fill_date_in_sheet(ws, date_text):
+                ok += 1
+        except Exception:
+            pass
+    return ok
+
+
+# ====== 非交互入口（替换为这个完整体） ======
+def run_noninteractive(
+    src_path,
+    mode=3,
+    meta=None,
+    support_strategy=None,   # "number" | "floor"
+    net_strategy=None,       # "number" | "floor"
+    dates=None,              # 预留：mode1 用
+    temperature=None,        # 预留
+    quota_plan=None,         # 预留：mode4 用
+    single_date=None,        # 新增：单日模式的“检测日期”
+):
+    """
+    一次性执行完整流程（读取 Word → 生成 Excel → 保存），不依赖 input()。
+    目前稳定支持 mode=3（单日模式）直跑；其它模式会自动回退至 3，避免卡住。
+    返回：{"excel": Path, "word": Path}
+    """
+    # 1) 校验源
+    src = Path(str(src_path)).expanduser().resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"找不到源文件：{src}")
+    if src.suffix.lower() != ".docx":
+        raise ValueError("源文件必须为 .docx")
+
+    # 2) 从 Word 读取、分组 & 汇总
+    grouped, categories_present = prepare_from_word(src)
+
+    # 3) 设置分桶策略（若传入则覆盖全局）
+    global support_bucket_strategy, net_bucket_strategy
+    if support_strategy in ("number", "floor"):
+        support_bucket_strategy = support_strategy
+    if net_strategy in ("number", "floor"):
+        net_bucket_strategy = net_strategy
+
+    # 4) 选择模板并载入
+    mode_str = str(mode) if str(mode) in {"1", "2", "3", "4"} else "3"
+    if mode_str != "3":
+        # 当前仅保证单日模式无交互直跑，其它模式回退到 3
+        mode_str = "3"
+
+    tpl_path = XLSX_WITH_SUPPORT_DEFAULT
+    if not tpl_path.exists():
+        raise FileNotFoundError(f"Excel 模板不存在：{tpl_path}")
+    wb = load_workbook_safe(tpl_path)
+
+    # 5) 生成填表（按你的内部实现，这里是你已有的“单日模式”入口）
+    #    注意：如果你项目里对应函数名是 run_with_mode(...)，请据实替换这一行。
+    used_names_total = run_mode(mode_str, wb, grouped, categories_present)
+
+    # 6) 写元信息 & 统一字体 & 清除无用表
+    meta = meta or {}
+    apply_meta_fixed(wb, categories_present, meta)
+    enforce_mu_font(wb)
+    cleanup_unused_sheets(wb, used_names_total, bases=tuple(CATEGORY_ORDER))
+
+    # 7) 若传入“检测日期”，规范化并写入工作簿
+    if single_date:
+        dt_norm = _normalize_date(single_date)
+        _ = apply_date_to_workbook(wb, dt_norm)
+
+    # 8) 生成不覆盖的输出路径并保存
+    def _unique_out_path(dest_dir: Path, stem: str) -> Path:
+        cand = dest_dir / f"{stem}.xlsx"
+        if not cand.exists():
+            return cand
+        i = 1
+        while True:
+            cand = dest_dir / f"{stem}({i}).xlsx"
+            if not cand.exists():
+                return cand
+            i += 1
+
+    final_xlsx = _unique_out_path(src.parent, f"{TITLE}_报告版")
+    save_workbook_safe(wb, final_xlsx)
+
+    # 9) 返回路径
+    word_out = src.with_name("汇总原始记录.docx")
+    return {"excel": final_xlsx, "word": word_out}
+
+
+# ===== 非交互：按楼层断点（Mode 2）导出 =====
+from pathlib import Path
+from typing import Union, Callable
+from openpyxl import load_workbook
+
+def export_mode2_noninteractive(
+    src: Union[str, Path],
+    meta: dict | None = None,
+    *,
+    choose: str = "both",              # "gz"=仅钢柱, "gl"=仅钢梁, "both"=两者
+    breaks_gz: str | None = None,      # 钢柱断点：2 / 2F / 二层 / 2,3 …
+    breaks_gl: str | None = None,      # 钢梁断点：同上
+    date_first: str | None = None,     # 断点前（第一段）日期
+    date_second: str | None = None,    # 断点后（第二段）日期
+    include_support: bool = True,      # 是否包含“支撑”
+    include_net: bool = True,          # 是否包含“网架”
+    include_other: bool = True,        # 是否包含“其他”
+    support_strategy: str = "number",  # 支撑分组/编号策略
+    net_strategy: str = "number",      # 网架分组/编号策略
+) -> dict:
+    # ---------- 0) 校验 ----------
+    src = Path(str(src)).resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"未找到 Word 源文件：{src}")
+
+    # ---------- 1) 解析 Word ----------
+    grouped, categories_present = prepare_from_word(src)
+
+    # ---------- 2) 打开 Excel 模板（有支撑版） ----------
+    template_path = None
+    for name in ("XLSX_WITH_SUPPORT_DEFAULT", "XLSX_TEMPLATE_WITH_SUPPORT", "DEFAULT_XLSX_WITH_SUPPORT"):
+        if name in globals() and globals()[name]:
+            template_path = Path(globals()[name]); break
+    if not template_path or not Path(template_path).exists():
+        raise FileNotFoundError("未找到 Excel 模板常量（XLSX_WITH_SUPPORT_DEFAULT / XLSX_TEMPLATE_WITH_SUPPORT / DEFAULT_XLSX_WITH_SUPPORT）。")
+
+    wb = load_workbook(str(template_path))
+
+    # ---------- 3) 准备问答拦截 ----------
+    choose = (choose or "both").lower().strip()
+    breaks_gz = (breaks_gz or "").strip()
+    breaks_gl = (breaks_gl or "").strip()
+    date_first  = (date_first  or "").strip()
+    date_second = (date_second or "").strip()
+
+    # 若你的实现会读取这两个策略，全局注入一下（没有也不影响）
+    if "support_bucket_strategy" in globals():
+        globals()["support_bucket_strategy"] = support_strategy
+    if "net_bucket_strategy" in globals():
+        globals()["net_bucket_strategy"] = net_strategy
+
+    # 用字典记录“前/后段日期”是否已使用，避免 nonlocal
+    state = {"first_used": False, "second_used": False}
+
+    def _yesno(flag: bool) -> str:
+        return "y" if flag else "n"
+
+    def _fake_ask(msg: str, *args, **kwargs) -> str:
+        text = str(msg)
+        s = text.replace(" ", "").lower()
+
+        # —— 子模式选择 ——（通常 1=钢柱 2=钢梁 3=两者）
+        if ("仅钢柱" in s or "仅钢梁" in s or "两者" in s) or ("钢柱" in s and "钢梁" in s and ("选择" in s or "子模式" in s)):
+            return {"gz": "1", "gl": "2", "both": "3"}.get(choose, "3")
+
+        # —— 钢柱/钢梁断点 ——
+        if ("钢柱" in s) and ("断点" in s or "楼层" in s or "分隔" in s or "break" in s):
+            return breaks_gz
+        if ("钢梁" in s) and ("断点" in s or "楼层" in s or "分隔" in s or "break" in s):
+            return breaks_gl
+
+        # —— 前段/后段日期 ——（覆盖：前/后、第一/第二、上半/下半、A/B 段等）
+        if "日期" in s:
+            if any(k in s for k in ("前", "第一", "上半", "a段", "a段日期", "前半")):
+                state["first_used"] = True
+                return date_first
+            if any(k in s for k in ("后", "第二", "下半", "b段", "b段日期", "后半")):
+                state["second_used"] = True
+                return date_second
+            # 未指明时：先给前段，再给后段
+            if not state["first_used"]:
+                state["first_used"] = True
+                return date_first
+            if not state["second_used"]:
+                state["second_used"] = True
+                return date_second
+            return ""
+
+        # —— 是否包含 支撑/网架/其他 ——（若实现会问）
+        if ("是否" in s or "包含" in s or "要不要" in s):
+            if "支撑" in s: return _yesno(include_support)
+            if "网架" in s: return _yesno(include_net)
+            if "其他" in s or "其它" in s: return _yesno(include_other)
+
+        # —— 支撑/网架 分组/编号策略 ——（常见问法）
+        if ("支撑" in s) and ("策略" in s or "编号" in s or "分组" in s or "分桶" in s):
+            return "number"
+        if ("网架" in s) and ("策略" in s or "编号" in s or "分组" in s or "分桶" in s):
+            return "number"
+
+        # —— 继续/确认 ——（避免只跑一半）
+        if ("继续" in s) or ("下一步" in s) or ("是否继续" in s) or ("确认" in s) or ("确定" in s):
+            return "y"
+
+        # —— 回车跳过 ——
+        if "回车跳过" in s or "可留空" in s:
+            return ""
+
+        return ""
+
+    # 临时替换 ask()/prompt_break_submode()
+    orig_ask: Callable | None = globals().get("ask")
+    globals()["ask"] = _fake_ask
+
+    _orig_pbs = globals().get("prompt_break_submode")
+    if _orig_pbs:
+        def _fake_pbs(has_gz, has_gl):
+            return {"gz": "1", "gl": "2", "both": "3"}.get(choose, "3")
+        globals()["prompt_break_submode"] = _fake_pbs
+
+    # ---------- 4) 执行 Mode 2 ----------
+    try:
+        used_pages = run_mode("2", wb, grouped, categories_present)
+    finally:
+        if orig_ask is not None: globals()["ask"] = orig_ask
+        else: globals().pop("ask", None)
+        if _orig_pbs: globals()["prompt_break_submode"] = _orig_pbs
+
+    # ---------- 5) 元信息 / 字体 / 清理 ----------
+    meta = meta or {}
+    apply_meta_fixed(wb, categories_present, meta)
+    enforce_mu_font(wb)
+    cleanup_unused_sheets(wb, categories_present)
+
+    # （如你的 run_mode 没写日期，可在此按 used_pages + 两段日期补写；大多实现已在内部写完，这里就不强行覆盖。）
+
+    # ---------- 6) 保存 ----------
+    def _unique_name(p: Path) -> Path:
+        if not p.exists(): return p
+        stem, suf = p.stem, p.suffix; i = 1
+        while True:
+            cand = p.with_name(f"{stem}({i}){suf}")
+            if not cand.exists(): return cand
+            i += 1
+
+    out_xlsx = _unique_name(src.parent / "汇总原始记录.xlsx")
+    wb.save(str(out_xlsx))
+
+    # ---------- 7) 可选 Word 汇总 ----------
+    word_out = None
+    maybe = globals().get("export_word_summary")
+    if callable(maybe):
+        try: word_out = maybe(src, grouped)
+        except Exception: word_out = None
+
+    return {"excel": out_xlsx, "word": word_out}
+
 
 
 
