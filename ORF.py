@@ -1,5 +1,4 @@
 
-
 # === 原始记录自动填写程序 ===
 
 
@@ -7,6 +6,7 @@ from pathlib import Path
 import re, copy, math, warnings, sys, os, unicodedata, ctypes
 from collections import defaultdict
 from datetime import datetime
+from typing import Union
 from docx import Document
 from docx.shared import RGBColor, Pt
 from openpyxl.styles import Font, Alignment
@@ -38,6 +38,14 @@ CATEGORY_ORDER = ["钢柱", "钢梁", "支撑", "网架", "其他"]
 # 支撑/网架 分桶策略："number"=按编号，"floor"=按楼层；仅本次运行生效
 support_bucket_strategy = None
 net_bucket_strategy = None
+
+# 轻量识别缓存：避免重复读取 Word
+_PROBE_CACHE = {
+    "src": None,
+    "grouped": None,
+    "all_rows": None,
+    "categories": None,
+}
 
 # —— 严防跨类/跨 μ 写串（开关）——
 STRICT_CROSS_CAT_GUARD = True
@@ -274,7 +282,7 @@ def detect_layout(tbl):
     return col_vals, col_avg, is_beam
 
 
-def extract_rows_with_progress(tbl, ti: int, T: int):  # noqa
+def extract_rows_with_progress(tbl, ti: int, T: int, *, show_progress: bool = True):  # noqa
     """
     从数据表格提取行数据，带实时进度提示。
 
@@ -299,7 +307,7 @@ def extract_rows_with_progress(tbl, ti: int, T: int):  # noqa
     last_flush = -1
 
     for ridx, r in enumerate(tbl.rows):
-        if ridx // 20 != last_flush:
+        if show_progress and ridx // 20 != last_flush:
             last_flush = ridx // 20
             pct = int((ridx + 1) * 100 / max(1, total))
             sys.stdout.write(f"\r📝 读取 Word：表 {ti}/{T}（{pct}%）")
@@ -879,26 +887,37 @@ def ensure_pages_slices_for_cat_muaware(wb, cat: str, blocks_by_bucket: dict[int
     return pages_slices, blocks_slices
 
 # ===== 快速探测文档中包含的构件类别（供前端静默识别用） =====
-from pathlib import Path
-from typing import Union
 
 def probe_categories_from_docx(src: Union[str, Path]) -> dict:
-    """
-    读取 Word，一次性返回包含的构件类别与数量。
-    返回示例：
-    {
-        "categories": ["钢柱", "钢梁", "支撑", "网架", "其他"],
-        "counts": {"钢柱": 392, "钢梁": 101, "支撑": 22, "网架": 0, "其他": 3}
-    }
-    """
+    """轻量识别 Word，返回类别顺序与数量，并写入缓存。"""
     p = Path(str(src)).resolve()
     if not p.exists():
         raise FileNotFoundError(f"未找到 Word 源文件：{p}")
-    grouped, categories_present = prepare_from_word(p)
-    counts = {k: (len(grouped.get(k, [])) if isinstance(grouped.get(k, []), (list, tuple)) else 0)
-              for k in set(list(grouped.keys()) + list(categories_present))}
-    # 保证所有关心的键都在
-    for k in ("钢柱", "钢梁", "支撑", "网架", "其他"):
+
+    cache_src = _PROBE_CACHE.get("src")
+    if cache_src and Path(str(cache_src)).resolve() == p:
+        grouped_cached = _PROBE_CACHE.get("grouped") or {}
+        cats_cached = _PROBE_CACHE.get("categories") or []
+        counts_cached = {c: len(grouped_cached.get(c, [])) for c in cats_cached}
+        for k in CATEGORY_ORDER:
+            counts_cached.setdefault(k, 0)
+        return {"categories": list(cats_cached), "counts": counts_cached}
+
+    groups_all_tables, all_rows = read_groups_from_doc(p, progress=False)
+    grouped = defaultdict(list)
+    for g in groups_all_tables:
+        grouped[kind_of(g["name"])].append(g)
+    categories_present = [cat for cat in CATEGORY_ORDER if grouped.get(cat)]
+
+    _PROBE_CACHE.update({
+        "src": str(p),
+        "grouped": grouped,
+        "all_rows": all_rows,
+        "categories": categories_present,
+    })
+
+    counts = {cat: len(grouped.get(cat, [])) for cat in categories_present}
+    for k in CATEGORY_ORDER:
         counts.setdefault(k, 0)
     return {"categories": list(categories_present), "counts": counts}
 
@@ -2489,16 +2508,219 @@ def prompt_break_submode(has_gz, has_gl):
 
 
 # ===== 主流程 =====
-def run_mode(mode: str, wb, grouped, categories_present):
+def _parse_breaks_text(text: str) -> list[int]:
+    tokens = re.split(r"[\s,，,;；、]+", str(text or ""))
+    vals = []
+    for tok in tokens:
+        if not tok:
+            continue
+        m = re.search(r"(\d+)", tok)
+        if not m:
+            continue
+        try:
+            vals.append(int(m.group(1)))
+        except ValueError:
+            continue
+    return sorted(set(vals))
+
+
+def _segment_blocks_by_floor(blocks, breaks: list[int]):
+    buckets = defaultdict(list)
+    for blk in blocks or []:
+        seg = segment_index(floor_of(blk.get("name", "")), breaks)
+        buckets[seg].append(blk)
+    if not buckets:
+        buckets[0] = []
+    return buckets
+
+
+def _segment_blocks_by_number(blocks, breaks: list[int], extractor):
+    buckets = defaultdict(list)
+    for blk in blocks or []:
+        raw = extractor(blk.get("name", ""))
+        if raw is None:
+            seg = len(breaks) if breaks else 0
+        else:
+            seg = len(breaks)
+            for idx, val in enumerate(breaks):
+                if raw <= val:
+                    seg = idx
+                    break
+        buckets[seg].append(blk)
+    if not buckets:
+        buckets[0] = []
+    return buckets
+
+
+def _run_mode2_auto(
+    wb,
+    grouped,
+    categories_present,
+    *,
+    breaks_gz: str = "",
+    breaks_gl: str = "",
+    include_support: bool = True,
+):
+    categories_present = [c for c in categories_present if grouped.get(c)]
+    if not include_support and "支撑" in categories_present:
+        categories_present = [c for c in categories_present if c != "支撑"]
+
+    breaks_gz_list = _parse_breaks_text(breaks_gz)
+    breaks_gl_list = _parse_breaks_text(breaks_gl)
+    anchor_breaks = sorted(set(breaks_gz_list + breaks_gl_list))
+
+    support_strategy = (globals().get("NONINTERACTIVE_SUPPORT_STRATEGY") or "number").lower()
+    net_strategy = (globals().get("NONINTERACTIVE_NET_STRATEGY") or "number").lower()
+
+    blocks_by_cat = {cat: expand_blocks(grouped.get(cat, []), PER_LINE_PER_BLOCK)
+                     for cat in categories_present}
+
+    buckets_by_cat = {}
+    segment_ids = set()
+
+    for cat in categories_present:
+        blocks = blocks_by_cat.get(cat, [])
+        if cat in ("钢柱", "钢梁"):
+            buckets = _segment_blocks_by_floor(blocks, anchor_breaks)
+        elif cat == "支撑":
+            if support_strategy == "floor":
+                buckets = _segment_blocks_by_floor(blocks, anchor_breaks)
+            else:
+                buckets = _segment_blocks_by_number(blocks, anchor_breaks, _wz_no)
+        elif cat == "网架":
+            if net_strategy == "floor":
+                buckets = _segment_blocks_by_floor(blocks, anchor_breaks)
+            else:
+                buckets = _segment_blocks_by_number(blocks, anchor_breaks, _net_no)
+        else:
+            buckets = defaultdict(list)
+            buckets[0] = list(blocks)
+        buckets_by_cat[cat] = buckets
+        segment_ids.update(buckets.keys())
+
+    if not segment_ids:
+        segment_ids = {0}
+    ordered_segments = sorted(segment_ids)
+
+    pages_slices_by_cat = {}
+    blocks_slices_by_cat = {}
+
+    for cat in categories_present:
+        bucket_map = {seg: list(buckets_by_cat[cat].get(seg, [])) for seg in ordered_segments}
+        if cat == "其他":
+            pages_list = []
+            blocks_list = []
+            for seg in ordered_segments:
+                seg_blocks = bucket_map.get(seg, [])
+                need = pages_needed(seg_blocks)
+                pages_batch = [] if not need else ensure_total_pages_from(wb, "钢柱", "其他", need)
+                pages_list.append(pages_batch)
+                blocks_list.append(seg_blocks)
+            pages_slices_by_cat[cat] = pages_list
+            blocks_slices_by_cat[cat] = blocks_list
+        else:
+            pages_slices, blocks_slices = ensure_pages_slices_for_cat_muaware(wb, cat, bucket_map)
+            pages_slices_by_cat[cat] = [_filter_pages_for_cat(sl, cat) for sl in pages_slices]
+            blocks_slices_by_cat[cat] = blocks_slices
+
+    total_blocks = 0
+    for cat in categories_present:
+        for seg_blocks in blocks_slices_by_cat[cat]:
+            total_blocks += len(seg_blocks)
+
+    prog = Prog(total_blocks or 1, "写入 Excel")
+
+    used_pages: list[str] = []
+    date_first = (globals().get("NONINTERACTIVE_MODE2_DATE_FIRST") or "").strip()
+    date_second = (globals().get("NONINTERACTIVE_MODE2_DATE_SECOND") or "").strip()
+    norm_first = _normalize_date(date_first) if date_first else ""
+    norm_second = _normalize_date(date_second) if date_second else ""
+
+    for seg_idx, _seg in enumerate(ordered_segments):
+        for cat in CATEGORY_ORDER:
+            if cat not in categories_present:
+                continue
+            pages_list = pages_slices_by_cat.get(cat, [])
+            blocks_list = blocks_slices_by_cat.get(cat, [])
+            if seg_idx >= len(pages_list):
+                continue
+            pages = pages_list[seg_idx]
+            blocks_piece = blocks_list[seg_idx]
+            if not pages:
+                continue
+            fill_blocks_to_pages(wb, pages, blocks_piece, prog)
+            used_pages.extend(pages)
+            date_to_write = norm_first if seg_idx == 0 else (norm_second or norm_first)
+            if date_to_write:
+                apply_meta_on_pages(wb, pages, date_to_write)
+
+    prog.finish()
+
+    for idx, name in enumerate(used_pages):
+        if name not in wb.sheetnames:
+            continue
+        cur = wb.sheetnames.index(name)
+        if cur != idx:
+            wb.move_sheet(wb[name], idx - cur)
+
+    cleanup_unused_mu_templates(wb, used_pages)
+    return used_pages
+
+
+def run_mode(
+    mode: str,
+    wb,
+    grouped=None,
+    categories_present=None,
+    *,
+    src: Union[str, Path] | None = None,
+    grouped_preloaded=None,
+    breaks_gz: str = "",
+    breaks_gl: str = "",
+    include_support: bool = True,
+):
     """按指定模式执行一次导出（全模式支持 μ 逻辑；mode4 暂保持原样流程）。"""
     global support_bucket_strategy, net_bucket_strategy
     support_bucket_strategy = None
     net_bucket_strategy = None
 
+    if grouped_preloaded is not None:
+        grouped_data = grouped_preloaded
+    elif grouped is not None:
+        grouped_data = grouped
+    elif src is not None:
+        grouped_data, categories_from_src = prepare_from_word(Path(src))
+        if categories_present is None:
+            categories_present = categories_from_src
+    elif _PROBE_CACHE.get("src") and Path(str(_PROBE_CACHE.get("src"))).exists() and src is None:
+        grouped_data = _PROBE_CACHE.get("grouped") or {}
+    else:
+        raise ValueError("run_mode 需要提供 grouped/grouped_preloaded/src 之一")
+
+    if isinstance(grouped_data, dict) and not isinstance(grouped_data, defaultdict):
+        tmp = defaultdict(list)
+        for k, v in grouped_data.items():
+            tmp[k] = list(v)
+        grouped_data = tmp
+
+    if categories_present is None:
+        categories_present = [cat for cat in CATEGORY_ORDER if grouped_data.get(cat)]
+
     # 先交给 mode4 的专用处理（不动它内部逻辑）
-    res = try_handle_mode4(mode, wb, grouped, categories_present)
+    res = try_handle_mode4(mode, wb, grouped_data, categories_present)
     if res is not None:
         return res
+
+    force_same_breaks = bool(globals().get("NONINTERACTIVE_MODE2_FORCE_SAME_BREAKS"))
+    if mode == "2" and (grouped_preloaded is not None or force_same_breaks):
+        return _run_mode2_auto(
+            wb,
+            grouped_data,
+            categories_present,
+            breaks_gz=breaks_gz,
+            breaks_gl=breaks_gl,
+            include_support=include_support,
+        )
 
     # ============ mode 2：按楼层断点 ============
     if mode == "2":
@@ -2506,7 +2728,7 @@ def run_mode(mode: str, wb, grouped, categories_present):
         has_gl = "钢梁" in categories_present
         sub = prompt_break_submode(has_gz, has_gl)
 
-        blocks_by_cat = {cat: expand_blocks(grouped[cat], PER_LINE_PER_BLOCK)
+        blocks_by_cat = {cat: expand_blocks(grouped_data[cat], PER_LINE_PER_BLOCK)
                          for cat in categories_present}
 
         # —— 子模式 3：无断点，整类一次性排（也用 μ-aware）——
@@ -2636,7 +2858,7 @@ def run_mode(mode: str, wb, grouped, categories_present):
         blocks_by_cat_ordered = {}
 
         for cat in categories_present:
-            blocks_all = expand_blocks(grouped[cat], PER_LINE_PER_BLOCK)
+            blocks_all = expand_blocks(grouped_data[cat], PER_LINE_PER_BLOCK)
             if cat == "其他":
                 need = pages_needed(blocks_all)
                 pages_by_cat[cat] = [] if not need else ensure_total_pages_from(wb, "钢柱", "其他", need)
@@ -2688,12 +2910,12 @@ def run_mode(mode: str, wb, grouped, categories_present):
 
     # ============ mode 1：日期分桶（每个“日桶”也 μ-aware） ============
     elif mode == "1":
-        buckets = prompt_date_buckets(categories_present, grouped)
+        buckets = prompt_date_buckets(categories_present, grouped_data)
         if buckets is None:
             return
 
         later_first = prompt_bucket_priority()
-        cat_byb, remain_by_cat = assign_by_buckets(grouped, buckets, later_first)
+        cat_byb, remain_by_cat = assign_by_buckets(grouped_data, buckets, later_first)
         ok, auto_last = preview_buckets_generic(cat_byb, remain_by_cat, buckets, categories_present)
         if not ok:
             return
@@ -2961,207 +3183,115 @@ def run_noninteractive(
 
 
 # ===== 非交互：按楼层断点（Mode 2）导出 =====
-from pathlib import Path
-from typing import Union, Callable
-from openpyxl import load_workbook
 
 def export_mode2_noninteractive(
-    src: Union[str, Path],
+    src_docx: Union[str, Path],
     meta: dict | None = None,
+    wb=None,
     *,
-    choose: str = "both",              # "gz"=仅钢柱, "gl"=仅钢梁, "both"=两者
-    breaks_gz: str | None = None,      # 钢柱断点：2 / 2F / 二层 / 2,3 …
-    breaks_gl: str | None = None,      # 钢梁断点：同上
-    date_first: str | None = None,     # 断点前（第一段）日期
-    date_second: str | None = None,    # 断点后（第二段）日期
-    include_support: bool = True,      # 是否包含“支撑”
-    include_net: bool = True,          # 是否包含“网架”
-    include_other: bool = True,        # 是否包含“其他”
-    support_strategy: str = "number",  # 支撑分组/编号策略
-    net_strategy: str = "number",      # 网架分组/编号策略
-) -> dict:
-    # ---------- 0) 校验 ----------
-    src = Path(str(src)).resolve()
+    breaks_gz: str = "",
+    breaks_gl: str = "",
+    date_first: str = "",
+    date_second: str = "",
+    include_support: bool = True,
+    support_strategy: str = "number",
+    net_strategy: str = "number",
+):
+    src = Path(str(src_docx)).resolve()
     if not src.exists():
         raise FileNotFoundError(f"未找到 Word 源文件：{src}")
 
-    # ---------- 1) 解析 Word ----------
-    grouped, categories_present = prepare_from_word(src)
+    grouped = None
+    categories_present = None
+    cache_src = _PROBE_CACHE.get("src")
+    if cache_src and Path(str(cache_src)).resolve() == src:
+        grouped = _PROBE_CACHE.get("grouped")
+        categories_present = _PROBE_CACHE.get("categories")
 
-    # ---------- 2) 打开 Excel 模板（有支撑版） ----------
-    template_path = None
-    for name in ("XLSX_WITH_SUPPORT_DEFAULT", "XLSX_TEMPLATE_WITH_SUPPORT", "DEFAULT_XLSX_WITH_SUPPORT"):
-        if name in globals() and globals()[name]:
-            template_path = Path(globals()[name]); break
-    if not template_path or not Path(template_path).exists():
-        raise FileNotFoundError("未找到 Excel 模板常量（XLSX_WITH_SUPPORT_DEFAULT / XLSX_TEMPLATE_WITH_SUPPORT / DEFAULT_XLSX_WITH_SUPPORT）。")
+    if not grouped:
+        info = probe_categories_from_docx(src)
+        grouped = _PROBE_CACHE.get("grouped")
+        if isinstance(info, dict):
+            categories_present = info.get("categories")
 
-    wb = load_workbook(str(template_path))
+    if not grouped:
+        groups_all_tables, all_rows = read_groups_from_doc(src, progress=False)
+        grouped = defaultdict(list)
+        for g in groups_all_tables:
+            grouped[kind_of(g["name"])].append(g)
+        categories_present = [cat for cat in CATEGORY_ORDER if grouped.get(cat)]
+        _PROBE_CACHE.update({
+            "src": str(src),
+            "grouped": grouped,
+            "all_rows": all_rows,
+            "categories": categories_present,
+        })
 
-    # ---------- 3) 准备问答拦截 ----------
-    choose = (choose or "both").lower().strip()
-    breaks_gz = (breaks_gz or "").strip()
-    breaks_gl = (breaks_gl or "").strip()
-    date_first  = (date_first  or "").strip()
-    date_second = (date_second or "").strip()
+    if not isinstance(grouped, defaultdict):
+        tmp = defaultdict(list)
+        for k, v in (grouped or {}).items():
+            tmp[k] = list(v)
+        grouped = tmp
 
-    # 若你的实现会读取这两个策略，全局注入一下（没有也不影响）
-    if "support_bucket_strategy" in globals():
-        globals()["support_bucket_strategy"] = support_strategy
-    if "net_bucket_strategy" in globals():
-        globals()["net_bucket_strategy"] = net_strategy
+    categories_present = categories_present or [cat for cat in CATEGORY_ORDER if grouped.get(cat)]
+    categories_present = list(categories_present)
+    if not include_support and "支撑" in categories_present:
+        categories_present.remove("支撑")
 
-    # 用字典记录“前/后段日期”是否已使用，避免 nonlocal
-    state = {"first_used": False, "second_used": False}
+    globals()["NONINTERACTIVE_MODE2_FORCE_SAME_BREAKS"] = True
+    globals()["NONINTERACTIVE_MODE2_DATE_FIRST"] = (date_first or "").strip()
+    globals()["NONINTERACTIVE_MODE2_DATE_SECOND"] = (date_second or "").strip()
+    globals()["NONINTERACTIVE_SUPPORT_STRATEGY"] = (support_strategy or "number").lower()
+    globals()["NONINTERACTIVE_NET_STRATEGY"] = (net_strategy or "number").lower()
 
-    def _yesno(flag: bool) -> str:
-        return "y" if flag else "n"
+    created_here = wb is None
+    if wb is None:
+        template_path = None
+        for name in ("XLSX_WITH_SUPPORT_DEFAULT", "XLSX_TEMPLATE_WITH_SUPPORT", "DEFAULT_XLSX_WITH_SUPPORT"):
+            if name in globals() and globals()[name]:
+                template_path = Path(globals()[name])
+                break
+        if not template_path or not template_path.exists():
+            raise FileNotFoundError("未找到 Excel 模板常量（XLSX_WITH_SUPPORT_DEFAULT / XLSX_TEMPLATE_WITH_SUPPORT / DEFAULT_XLSX_WITH_SUPPORT）。")
+        wb = load_workbook_safe(template_path)
 
-    def _fake_ask(msg: str, *args, **kwargs) -> str:
-        text = str(msg)
-        s = text.replace(" ", "").lower()
-
-        # —— 子模式选择 ——（通常 1=钢柱 2=钢梁 3=两者）
-        if ("仅钢柱" in s or "仅钢梁" in s or "两者" in s) or ("钢柱" in s and "钢梁" in s and ("选择" in s or "子模式" in s)):
-            return {"gz": "1", "gl": "2", "both": "3"}.get(choose, "3")
-
-        # —— 钢柱/钢梁断点 ——
-        if ("钢柱" in s) and ("断点" in s or "楼层" in s or "分隔" in s or "break" in s):
-            return breaks_gz
-        if ("钢梁" in s) and ("断点" in s or "楼层" in s or "分隔" in s or "break" in s):
-            return breaks_gl
-
-        # —— 前段/后段日期 ——（覆盖：前/后、第一/第二、上半/下半、A/B 段等）
-        if "日期" in s:
-            if any(k in s for k in ("前", "第一", "上半", "a段", "a段日期", "前半")):
-                state["first_used"] = True
-                return date_first
-            if any(k in s for k in ("后", "第二", "下半", "b段", "b段日期", "后半")):
-                state["second_used"] = True
-                return date_second
-            # 未指明时：先给前段，再给后段
-            if not state["first_used"]:
-                state["first_used"] = True
-                return date_first
-            if not state["second_used"]:
-                state["second_used"] = True
-                return date_second
-            return ""
-
-        # —— 是否包含 支撑/网架/其他 ——（若实现会问）
-        if ("是否" in s or "包含" in s or "要不要" in s):
-            if "支撑" in s: return _yesno(include_support)
-            if "网架" in s: return _yesno(include_net)
-            if "其他" in s or "其它" in s: return _yesno(include_other)
-
-        # —— 支撑/网架 分组/编号策略 ——（常见问法）
-        if ("支撑" in s) and ("策略" in s or "编号" in s or "分组" in s or "分桶" in s):
-            return "number"
-        if ("网架" in s) and ("策略" in s or "编号" in s or "分组" in s or "分桶" in s):
-            return "number"
-
-        # —— 继续/确认 ——（避免只跑一半）
-        if ("继续" in s) or ("下一步" in s) or ("是否继续" in s) or ("确认" in s) or ("确定" in s):
-            return "y"
-
-        # —— 回车跳过 ——
-        if "回车跳过" in s or "可留空" in s:
-            return ""
-
-        return ""
-
-    # 临时替换 ask()/prompt_break_submode()
-    orig_ask: Callable | None = globals().get("ask")
-    globals()["ask"] = _fake_ask
-
-    _orig_pbs = globals().get("prompt_break_submode")
-    if _orig_pbs:
-        def _fake_pbs(has_gz, has_gl):
-            return {"gz": "1", "gl": "2", "both": "3"}.get(choose, "3")
-        globals()["prompt_break_submode"] = _fake_pbs
-
-    # ---------- 4) 执行 Mode 2 ----------
     try:
-        used_pages = run_mode("2", wb, grouped, categories_present)
+        used_pages = run_mode(
+            "2",
+            wb,
+            categories_present=categories_present,
+            grouped_preloaded=grouped,
+            breaks_gz=breaks_gz or "",
+            breaks_gl=breaks_gl or "",
+            include_support=include_support,
+        )
     finally:
-        if orig_ask is not None: globals()["ask"] = orig_ask
-        else: globals().pop("ask", None)
-        if _orig_pbs: globals()["prompt_break_submode"] = _orig_pbs
+        for key in (
+            "NONINTERACTIVE_MODE2_FORCE_SAME_BREAKS",
+            "NONINTERACTIVE_MODE2_DATE_FIRST",
+            "NONINTERACTIVE_MODE2_DATE_SECOND",
+            "NONINTERACTIVE_SUPPORT_STRATEGY",
+            "NONINTERACTIVE_NET_STRATEGY",
+        ):
+            globals().pop(key, None)
 
-    # ---------- 5) 元信息 / 字体 / 清理 ----------
-    meta = meta or {}
-    apply_meta_fixed(wb, categories_present, meta)
-    enforce_mu_font(wb)
-    cleanup_unused_sheets(wb, categories_present)
+    if created_here:
+        all_rows = _PROBE_CACHE.get("all_rows")
+        if all_rows:
+            doc_out = build_summary_doc_with_progress(all_rows)
+            set_doc_font_progress(doc_out, DEFAULT_FONT_PT)
+            save_docx_safe(doc_out, src.with_name("汇总原始记录.docx"))
+        apply_meta_fixed(wb, categories_present, meta or {})
+        enforce_mu_font(wb)
+        cleanup_unused_sheets(wb, used_pages, bases=tuple(CATEGORY_ORDER))
+        final_path = src.with_name(f"{TITLE}_报告版.xlsx")
+        save_workbook_safe(wb, final_path)
+        word_out = src.with_name("汇总原始记录.docx")
+        return {"excel": final_path, "word": word_out}
 
-    # （如你的 run_mode 没写日期，可在此按 used_pages + 两段日期补写；大多实现已在内部写完，这里就不强行覆盖。）
+    return {"used_pages": used_pages, "workbook": wb}
 
-    # ---------- 6) 保存 ----------
-    def _unique_name(p: Path) -> Path:
-        if not p.exists(): return p
-        stem, suf = p.stem, p.suffix; i = 1
-        while True:
-            cand = p.with_name(f"{stem}({i}){suf}")
-            if not cand.exists(): return cand
-            i += 1
-
-    out_xlsx = _unique_name(src.parent / "汇总原始记录.xlsx")
-    wb.save(str(out_xlsx))
-
-    # ---------- 7) 可选 Word 汇总 ----------
-    word_out = None
-    maybe = globals().get("export_word_summary")
-    if callable(maybe):
-        try: word_out = maybe(src, grouped)
-        except Exception: word_out = None
-
-    return {"excel": out_xlsx, "word": word_out}
-
-
-
-
-# ===== 顶层交互循环 =====
-def main():
-    print(f" {TITLE} — {VERSION}")
-    while True:
-        path = ask_path()
-        if path is None:
-            continue
-        if path == "__QUIT__":
-            print("Bye")
-            break
-        if not is_valid_path(path):
-            print("× 路径无效。")
-            continue
-        try:
-            src = Path(path)
-            print(f"✅ 使用 Word：{src}")
-            global support_bucket_strategy, net_bucket_strategy
-            support_bucket_strategy = None
-            net_bucket_strategy = None
-
-            grouped, categories_present = prepare_from_word(src)
-
-            meta = {"proj": "", "order": ""}
-
-            run_with_mode(src, grouped, categories_present, meta)
-
-        except FileInUse as e:
-            # ↓↓↓ 友好提示，不打印堆栈，不吓用户
-            print("\n⚠️  文件被占用，无法读写：")
-            print(f"   - {e}")
-            print("✅  请关闭相关的 Excel / Word / 预览窗口（含资源管理器预览窗格），然后重新运行本程序。\n")
-            # 直接回到主循环
-            continue
-
-        except Exception as e:
-            # 其他异常仍提示，但不长篇堆栈
-            print(f"× 出错：{e}")
-            continue
-
-
-# ===== 读取 Word 分组 =====
-def read_groups_from_doc(path: Path):
+def read_groups_from_doc(path: Path, *, progress: bool = True):
     """
     从Word文档中读取并解析构件数据组，返回结构化分组数据和原始行数据。
 
@@ -3188,9 +3318,84 @@ def read_groups_from_doc(path: Path):
         if not is_data_table(tbl):
             continue
         used += 1
-        part = extract_rows_with_progress(tbl, used, T)
-        if part: all_rows.extend(part)
+        part = extract_rows_with_progress(tbl, used, T, show_progress=progress)
+        if part:
+            all_rows.extend(part)
     return groups_from_your_rows(all_rows), all_rows
+
+
+def main():
+    """命令行交互入口。"""
+    print(f"{TITLE} {VERSION}")
+    print("输入 help 查看模式说明；随时输入 q 返回上一步。")
+
+    while True:
+        try:
+            src = prompt_path("📄 请选择原始记录 Word", WORD_SRC_DEFAULT)
+        except BackStep:
+            print("↩ 已返回。")
+            continue
+        except KeyboardInterrupt:
+            print("\n已取消。")
+            return
+        except EOFError:
+            print("\n已退出。")
+            return
+
+        try:
+            probe = probe_categories_from_docx(src)
+        except Exception as exc:
+            print(f"❌ 识别失败：{exc}")
+            continue
+
+        categories = list((probe or {}).get("categories") or [])
+        counts = (probe or {}).get("counts") or {}
+        if categories:
+            print("📊 识别：" + "、".join(f"{cat} {counts.get(cat, 0)}" for cat in categories))
+        else:
+            print("⚠️ 未识别到可用构件。")
+
+        all_rows = _PROBE_CACHE.get("all_rows")
+        if all_rows:
+            try:
+                doc_out = build_summary_doc_with_progress(all_rows)
+                set_doc_font_progress(doc_out, DEFAULT_FONT_PT)
+                out_docx = Path(src).with_name("汇总原始记录.docx")
+                print("💾 正在保存汇总 Word …")
+                save_docx_safe(doc_out, out_docx)
+                print(f"✅ 汇总 Word 已保存：{out_docx}")
+            except Exception as exc:
+                print(f"⚠️ 汇总 Word 保存失败：{exc}")
+
+        try:
+            proj = ask("工程名称（回车跳过，输入 q 返回）：")
+            order = ask("委托编号（回车跳过，输入 q 返回）：")
+        except BackStep:
+            print("↩ 返回文件选择。")
+            continue
+
+        meta = {}
+        if proj:
+            meta["proj"] = proj
+        if order:
+            meta["order"] = order
+
+        grouped_cached = _PROBE_CACHE.get("grouped") or defaultdict(list)
+        try:
+            run_with_mode(Path(src), grouped_cached, categories or None, meta)
+        except BackStep:
+            print("↩ 返回模式选择。")
+            continue
+        except Exception as exc:
+            print(f"❌ 出表失败：{exc}")
+            continue
+
+        try:
+            again = ask("是否继续处理其他文件？（y=继续 / 其它=退出）：", lower=True)
+        except BackStep:
+            break
+        if again != "y":
+            break
 
 
 if __name__ == "__main__":
