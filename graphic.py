@@ -15,7 +15,8 @@ from PySide6.QtCore import Qt, QSize, QThread, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
     QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QRadioButton, QButtonGroup,
-    QCheckBox, QMessageBox, QSpacerItem, QSizePolicy, QStackedWidget, QFrame
+    QCheckBox, QMessageBox, QSpacerItem, QSizePolicy, QStackedWidget, QFrame,
+    QComboBox,
 )
 
 
@@ -225,14 +226,6 @@ class MainWindow(QMainWindow):
         self.box_m2 = QGroupBox("3B. Mode 2（楼层断点）")
         lm2 = QVBoxLayout(self.box_m2)
 
-        row_sub = QHBoxLayout()
-        row_sub.addWidget(QLabel("子模式"))
-        self.rb_both = QRadioButton("两者"); self.rb_gz = QRadioButton("仅钢柱"); self.rb_gl = QRadioButton("仅钢梁")
-        self.grp_sub = QButtonGroup(self)
-        for i, b in enumerate([self.rb_both, self.rb_gz, self.rb_gl], start=1):
-            self.grp_sub.addButton(b, i); row_sub.addWidget(b)
-        lm2.addLayout(row_sub)
-
         row_bp1 = QHBoxLayout()
         self.lb_bp_gz = QLabel("钢柱断点")
         self.ed_bp_gz = QLineEdit(); self.ed_bp_gz.setPlaceholderText("例：3 6 10（空=不分段）")
@@ -255,10 +248,22 @@ class MainWindow(QMainWindow):
         row_inc = QHBoxLayout()
         row_inc.addWidget(QLabel("可包含"))
         self.ck_support = QCheckBox("支撑")   # 数量会在文本里补 "(N)"
-        self.ck_net     = QCheckBox("网架")
-        self.ck_other   = QCheckBox("其他")
-        row_inc.addWidget(self.ck_support); row_inc.addWidget(self.ck_net); row_inc.addWidget(self.ck_other)
+        row_inc.addWidget(self.ck_support)
         row_inc.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
+
+        row_strategy = QHBoxLayout()
+        self.lb_sup_strategy = QLabel("支撑分段")
+        self.cmb_sup_strategy = QComboBox(); self.cmb_sup_strategy.addItems(["编号", "楼层"])
+        self.cmb_sup_strategy.setCurrentIndex(0)
+        row_strategy.addWidget(self.lb_sup_strategy)
+        row_strategy.addWidget(self.cmb_sup_strategy)
+        row_strategy.addSpacing(16)
+        self.lb_net_strategy = QLabel("网架分段")
+        self.cmb_net_strategy = QComboBox(); self.cmb_net_strategy.addItems(["编号", "楼层"])
+        self.cmb_net_strategy.setCurrentIndex(0)
+        row_strategy.addWidget(self.lb_net_strategy)
+        row_strategy.addWidget(self.cmb_net_strategy)
+        row_strategy.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
 
         row_go = QHBoxLayout()
         row_go.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
@@ -266,7 +271,7 @@ class MainWindow(QMainWindow):
         self.btn_run_m2.setFixedSize(QSize(160, 36))
         row_go.addWidget(self.btn_run_m2)
 
-        for r in (row_bp1, row_bp2, row_dt, row_inc, row_go):
+        for r in (row_bp1, row_bp2, row_dt, row_inc, row_strategy, row_go):
             lm2.addLayout(r)
 
         # 容器：只显示当前模式对应的表单
@@ -380,42 +385,35 @@ class MainWindow(QMainWindow):
                 num = self.counts.get(k, 0)
                 parts.append(f"{k}（{num}）" if num else f"{k}")
         self.lb_found.setText("、".join(parts) if parts else "未识别到有效构件")
-
     def _apply_detection_to_mode2_ui(self):
-        # 子模式（仅针对钢柱/钢梁）
         gz_ok = self.present.get("钢柱", False)
         gl_ok = self.present.get("钢梁", False)
-        both_ok = gz_ok and gl_ok
 
-        self.rb_both.setVisible(both_ok)
-        self.rb_gz.setVisible(gz_ok)
-        self.rb_gl.setVisible(gl_ok)
-
-        if both_ok:
-            self.rb_both.setChecked(True)
-        elif gz_ok:
-            self.rb_gz.setChecked(True)
-        elif gl_ok:
-            self.rb_gl.setChecked(True)
-        else:
+        if not (gz_ok or gl_ok):
             self.box_m2.setDisabled(True)
             self.status.setText("⚠ 未识别到钢柱/钢梁，Mode 2 可能不可用。")
+        else:
+            self.box_m2.setDisabled(False)
 
-        # 断点输入显隐
         self.lb_bp_gz.setVisible(gz_ok); self.ed_bp_gz.setVisible(gz_ok)
         self.lb_bp_gl.setVisible(gl_ok); self.ed_bp_gl.setVisible(gl_ok)
 
-        # 其他构件（带数量）
-        def set_ck(ck: QCheckBox, key: str):
-            vis = self.present.get(key, False)
-            ck.setVisible(vis); ck.setEnabled(vis); ck.setChecked(vis)
-            num = self.counts.get(key, 0)
-            base = key if num == 0 else f"{key}（{num}）"
-            ck.setText(base)
+        sup_ok = self.present.get("支撑", False)
+        num_sup = self.counts.get("支撑", 0)
+        self.ck_support.setVisible(sup_ok)
+        self.ck_support.setEnabled(sup_ok)
+        self.ck_support.setChecked(sup_ok)
+        self.ck_support.setText("支撑" if num_sup == 0 else f"支撑（{num_sup}）")
+        self.lb_sup_strategy.setVisible(sup_ok)
+        self.cmb_sup_strategy.setVisible(sup_ok)
+        if not sup_ok:
+            self.cmb_sup_strategy.setCurrentIndex(0)
 
-        set_ck(self.ck_support, "支撑")
-        set_ck(self.ck_net, "网架")
-        set_ck(self.ck_other, "其他")
+        net_ok = self.present.get("网架", False)
+        self.lb_net_strategy.setVisible(net_ok)
+        self.cmb_net_strategy.setVisible(net_ok)
+        if not net_ok:
+            self.cmb_net_strategy.setCurrentIndex(0)
 
     # ====== 返回 Step1 重选文件 ======
     def _go_back_to_select(self):
@@ -444,24 +442,23 @@ class MainWindow(QMainWindow):
     # ====== 生成：Mode 2 ======
     def _on_run_mode2(self):
         if not self.doc_path:
-            QMessageBox.warning(self, "提示", "请先选择 Word 源文件。"); return
-
-        # 子模式（钢柱/钢梁）
-        if self.rb_both.isVisible() and self.rb_both.isChecked():
-            choose = "both"
-        elif self.rb_gz.isVisible() and self.rb_gz.isChecked():
-            choose = "gz"
-        else:
-            choose = "gl"
+            QMessageBox.warning(self, "提示", "请先选择 Word 源文件。");
+            return
 
         bp_gz = (self.ed_bp_gz.text() or "").strip() if self.ed_bp_gz.isVisible() else ""
         bp_gl = (self.ed_bp_gl.text() or "").strip() if self.ed_bp_gl.isVisible() else ""
-        dt_first  = (self.ed_dt_first.text() or "").strip()
+        dt_first = (self.ed_dt_first.text() or "").strip()
         dt_second = (self.ed_dt_second.text() or "").strip()
 
         inc_support = self.ck_support.isVisible() and self.ck_support.isChecked()
-        inc_net     = self.ck_net.isVisible() and self.ck_net.isChecked()
-        inc_other   = self.ck_other.isVisible() and self.ck_other.isChecked()
+
+        sup_strategy = "number"
+        if self.cmb_sup_strategy.isVisible() and self.cmb_sup_strategy.currentIndex() == 1:
+            sup_strategy = "floor"
+
+        net_strategy = "number"
+        if self.cmb_net_strategy.isVisible() and self.cmb_net_strategy.currentIndex() == 1:
+            net_strategy = "floor"
 
         meta = {}
 
@@ -469,21 +466,20 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             out = export_mode2_noninteractive(
-                src=str(self.doc_path),
+                src_docx=str(self.doc_path),
                 meta=meta,
-                choose=choose,
                 breaks_gz=bp_gz,
                 breaks_gl=bp_gl,
                 date_first=dt_first,
                 date_second=dt_second,
                 include_support=inc_support,
-                include_net=inc_net,
-                include_other=inc_other,
-                support_strategy="number",
-                net_strategy="number",
+                support_strategy=sup_strategy,
+                net_strategy=net_strategy,
             )
-            xlsx = out.get("excel"); word = out.get("word")
-            QMessageBox.information(self, "完成", f"✅ 生成完成！\nExcel：{xlsx}\n汇总Word：{word}")
+            xlsx = out.get("excel");
+            word = out.get("word")
+            if xlsx:
+                QMessageBox.information(self, "完成", f"✅ 生成完成！\nExcel：{xlsx}\n汇总Word：{word}")
             self.status.setText("✅ 楼层断点完成")
         except Exception as e:
             QMessageBox.critical(self, "失败", f"生成失败：\n{e}")
