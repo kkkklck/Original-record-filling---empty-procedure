@@ -2510,18 +2510,29 @@ def prompt_break_submode(has_gz, has_gl):
 # ===== 主流程 =====
 def _parse_breaks_text(text: str) -> list[int]:
     tokens = re.split(r"[\s,，,;；、]+", str(text or ""))
-    vals = []
+    vals: set[int] = set()
     for tok in tokens:
+        tok = tok.strip()
         if not tok:
             continue
-        m = re.search(r"(\d+)", tok)
-        if not m:
+        norm = re.sub(r"[~～〜－—–−至到]", "-", tok)
+        m_range = re.fullmatch(r"(\d+)\s*-\s*(\d+)", norm)
+        if m_range:
+            start = int(m_range.group(1))
+            end = int(m_range.group(2))
+            if start <= end:
+                vals.update(range(start, end + 1))
+            else:
+                vals.update(range(end, start + 1))
+            continue
+        m_single = re.search(r"(\d+)", tok)
+        if not m_single:
             continue
         try:
-            vals.append(int(m.group(1)))
+            vals.add(int(m_single.group(1)))
         except ValueError:
             continue
-    return sorted(set(vals))
+    return sorted(vals)
 
 
 def _segment_blocks_by_floor(blocks, breaks: list[int]):
@@ -2575,6 +2586,8 @@ def _run_mode2_auto(
 
     support_strategy = (globals().get("NONINTERACTIVE_SUPPORT_STRATEGY") or "number").lower()
     net_strategy = (globals().get("NONINTERACTIVE_NET_STRATEGY") or "number").lower()
+    net_breaks_raw = (globals().get("NONINTERACTIVE_NET_BREAKS") or "").strip()
+    net_breaks_list = _parse_breaks_text(net_breaks_raw) if net_breaks_raw else anchor_breaks
 
     blocks_by_cat = {cat: expand_blocks(grouped.get(cat, []), PER_LINE_PER_BLOCK)
                      for cat in categories_present}
@@ -2593,9 +2606,9 @@ def _run_mode2_auto(
                 buckets = _segment_blocks_by_number(blocks, sup_breaks_list, _wz_no)
         elif cat == "网架":
             if net_strategy == "floor":
-                buckets = _segment_blocks_by_floor(blocks, anchor_breaks)
+                buckets = _segment_blocks_by_floor(blocks, net_breaks_list)
             else:
-                buckets = _segment_blocks_by_number(blocks, anchor_breaks, _net_no)
+                buckets = _segment_blocks_by_number(blocks, net_breaks_list, _net_no)
         else:
             buckets = defaultdict(list)
             buckets[0] = list(blocks)
@@ -3196,6 +3209,7 @@ def export_mode2_noninteractive(
     breaks_gz: str = "",
     breaks_gl: str = "",
     breaks_support: str = "",
+    breaks_net: str = "",
     date_first: str = "",
     date_second: str = "",
     include_support: bool = True,
@@ -3249,6 +3263,7 @@ def export_mode2_noninteractive(
     globals()["NONINTERACTIVE_SUPPORT_BREAKS"] = (breaks_support or "").strip()
     globals()["NONINTERACTIVE_SUPPORT_STRATEGY"] = (support_strategy or "number").lower()
     globals()["NONINTERACTIVE_NET_STRATEGY"] = (net_strategy or "number").lower()
+    globals()["NONINTERACTIVE_NET_BREAKS"] = (breaks_net or "").strip()
 
     created_here = wb is None
     if wb is None:
@@ -3279,6 +3294,7 @@ def export_mode2_noninteractive(
             "NONINTERACTIVE_SUPPORT_BREAKS",
             "NONINTERACTIVE_SUPPORT_STRATEGY",
             "NONINTERACTIVE_NET_STRATEGY",
+            "NONINTERACTIVE_NET_BREAKS",
         ):
             globals().pop(key, None)
 
