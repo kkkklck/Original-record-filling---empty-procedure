@@ -269,13 +269,19 @@ class MainWindow(QMainWindow):
         row_sup_bp.addWidget(self.lb_sup_bp)
         row_sup_bp.addWidget(self.ed_bp_sup, 1)
 
+        row_net_bp = QHBoxLayout()
+        self.lb_net_bp = QLabel("网架断点")
+        self.ed_bp_net = QLineEdit(); self.ed_bp_net.setPlaceholderText("例：10 20 30（空=不分段）")
+        row_net_bp.addWidget(self.lb_net_bp)
+        row_net_bp.addWidget(self.ed_bp_net, 1)
+
         row_go = QHBoxLayout()
         row_go.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
         self.btn_run_m2 = QPushButton("生成（楼层断点）")
         self.btn_run_m2.setFixedSize(QSize(160, 36))
         row_go.addWidget(self.btn_run_m2)
 
-        for r in (row_bp, row_dt, row_inc, row_strategy, row_sup_bp, row_go):
+        for r in (row_bp, row_dt, row_inc, row_strategy, row_sup_bp, row_net_bp, row_go):
             lm2.addLayout(r)
 
         self.lb_bp_common.setVisible(False)
@@ -284,10 +290,14 @@ class MainWindow(QMainWindow):
         self.lb_sup_bp.setVisible(False)
         self.ed_bp_sup.setVisible(False)
         self.ed_bp_sup.setEnabled(False)
+        self.lb_net_bp.setVisible(False)
+        self.ed_bp_net.setVisible(False)
 
         self.ck_support.toggled.connect(lambda on: self.ed_bp_sup.setEnabled(on))
         self.cmb_sup_strategy.currentIndexChanged.connect(self._update_sup_bp_ui)
+        self.cmb_net_strategy.currentIndexChanged.connect(self._update_net_bp_ui)
         self._update_sup_bp_ui()
+        self._update_net_bp_ui()
 
         # 容器：只显示当前模式对应的表单
         self.panel_wrap = QVBoxLayout()
@@ -442,24 +452,37 @@ class MainWindow(QMainWindow):
             self.ed_bp_sup.setEnabled(False)
             self.ed_bp_sup.clear()
 
-        net_ok = self.present.get("网架", False)
-        self.lb_net_strategy.setVisible(net_ok)
-        self.cmb_net_strategy.setVisible(net_ok)
-        if not net_ok:
-            self.cmb_net_strategy.setCurrentIndex(0)
+            net_ok = self.present.get("网架", False)
+            self.lb_net_strategy.setVisible(net_ok)
+            self.cmb_net_strategy.setVisible(net_ok)
+            self.lb_net_bp.setVisible(net_ok)
+            self.ed_bp_net.setVisible(net_ok)
+            if not net_ok:
+                self.cmb_net_strategy.setCurrentIndex(0)
+                self.ed_bp_net.clear()
 
-        self._update_sup_bp_ui()
+            self._update_sup_bp_ui()
+            self._update_net_bp_ui()
 
-    def _update_sup_bp_ui(self):
-        if not hasattr(self, "cmb_sup_strategy"):
-            return
-        if self.cmb_sup_strategy.currentIndex() == 1:
-            self.lb_sup_bp.setText("支撑断点（楼层）")
-            self.ed_bp_sup.setPlaceholderText("例：3 6 10（空=不分段）")
-        else:
-            self.lb_sup_bp.setText("支撑断点（编号）")
-            self.ed_bp_sup.setPlaceholderText("例：10 20 30（空=不分段）")
+        def _update_sup_bp_ui(self):
+            if not hasattr(self, "cmb_sup_strategy"):
+                return
+            if self.cmb_sup_strategy.currentIndex() == 1:
+                self.lb_sup_bp.setText("支撑断点（楼层）")
+                self.ed_bp_sup.setPlaceholderText("例：3 6 10（空=不分段）")
+            else:
+                self.lb_sup_bp.setText("支撑断点（编号）")
+                self.ed_bp_sup.setPlaceholderText("例：10 20 30（空=不分段）")
 
+        def _update_net_bp_ui(self):
+            if not hasattr(self, "cmb_net_strategy"):
+                return
+            if self.cmb_net_strategy.currentIndex() == 1:
+                self.lb_net_bp.setText("网架断点（楼层）")
+                self.ed_bp_net.setPlaceholderText("例：3 6 10（空=不分段）")
+            else:
+                self.lb_net_bp.setText("网架断点（编号）")
+                self.ed_bp_net.setPlaceholderText("例：10 20 30（空=不分段）")
 
     # ====== 返回 Step1 重选文件 ======
     def _go_back_to_select(self):
@@ -495,6 +518,7 @@ class MainWindow(QMainWindow):
         bp_sup = ""
         if self.ed_bp_sup.isVisible() and self.ed_bp_sup.isEnabled():
             bp_sup = (self.ed_bp_sup.text() or "").strip()
+        bp_net = (self.ed_bp_net.text() or "").strip() if self.ed_bp_net.isVisible() else ""
         dt_first = (self.ed_dt_first.text() or "").strip()
         dt_second = (self.ed_dt_second.text() or "").strip()
 
@@ -519,6 +543,7 @@ class MainWindow(QMainWindow):
                 breaks_gz=bp_common,
                 breaks_gl=bp_common,
                 breaks_support=bp_sup,
+                breaks_net=bp_net,
                 date_first=dt_first,
                 date_second=dt_second,
                 include_support=inc_support,
