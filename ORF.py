@@ -2559,6 +2559,7 @@ def _run_mode2_auto(
     *,
     breaks_gz: str = "",
     breaks_gl: str = "",
+    breaks_support: str = "",
     include_support: bool = True,
 ):
     categories_present = [c for c in categories_present if grouped.get(c)]
@@ -2568,6 +2569,9 @@ def _run_mode2_auto(
     breaks_gz_list = _parse_breaks_text(breaks_gz)
     breaks_gl_list = _parse_breaks_text(breaks_gl)
     anchor_breaks = sorted(set(breaks_gz_list + breaks_gl_list))
+
+    sup_breaks_raw = (globals().get("NONINTERACTIVE_SUPPORT_BREAKS") or "").strip()
+    sup_breaks_list = _parse_breaks_text(sup_breaks_raw) if sup_breaks_raw else anchor_breaks
 
     support_strategy = (globals().get("NONINTERACTIVE_SUPPORT_STRATEGY") or "number").lower()
     net_strategy = (globals().get("NONINTERACTIVE_NET_STRATEGY") or "number").lower()
@@ -2584,9 +2588,9 @@ def _run_mode2_auto(
             buckets = _segment_blocks_by_floor(blocks, anchor_breaks)
         elif cat == "支撑":
             if support_strategy == "floor":
-                buckets = _segment_blocks_by_floor(blocks, anchor_breaks)
+                buckets = _segment_blocks_by_floor(blocks, sup_breaks_list)
             else:
-                buckets = _segment_blocks_by_number(blocks, anchor_breaks, _wz_no)
+                buckets = _segment_blocks_by_number(blocks, sup_breaks_list, _wz_no)
         elif cat == "网架":
             if net_strategy == "floor":
                 buckets = _segment_blocks_by_floor(blocks, anchor_breaks)
@@ -2633,8 +2637,8 @@ def _run_mode2_auto(
     used_pages: list[str] = []
     date_first = (globals().get("NONINTERACTIVE_MODE2_DATE_FIRST") or "").strip()
     date_second = (globals().get("NONINTERACTIVE_MODE2_DATE_SECOND") or "").strip()
-    norm_first = _normalize_date(date_first) if date_first else ""
-    norm_second = _normalize_date(date_second) if date_second else ""
+    norm_first = normalize_date(date_first) if date_first else ""
+    norm_second = normalize_date(date_second) if date_second else ""
 
     for seg_idx, _seg in enumerate(ordered_segments):
         for cat in CATEGORY_ORDER:
@@ -3191,6 +3195,7 @@ def export_mode2_noninteractive(
     *,
     breaks_gz: str = "",
     breaks_gl: str = "",
+    breaks_support: str = "",
     date_first: str = "",
     date_second: str = "",
     include_support: bool = True,
@@ -3241,6 +3246,7 @@ def export_mode2_noninteractive(
     globals()["NONINTERACTIVE_MODE2_FORCE_SAME_BREAKS"] = True
     globals()["NONINTERACTIVE_MODE2_DATE_FIRST"] = (date_first or "").strip()
     globals()["NONINTERACTIVE_MODE2_DATE_SECOND"] = (date_second or "").strip()
+    globals()["NONINTERACTIVE_SUPPORT_BREAKS"] = (breaks_support or "").strip()
     globals()["NONINTERACTIVE_SUPPORT_STRATEGY"] = (support_strategy or "number").lower()
     globals()["NONINTERACTIVE_NET_STRATEGY"] = (net_strategy or "number").lower()
 
@@ -3270,6 +3276,7 @@ def export_mode2_noninteractive(
             "NONINTERACTIVE_MODE2_FORCE_SAME_BREAKS",
             "NONINTERACTIVE_MODE2_DATE_FIRST",
             "NONINTERACTIVE_MODE2_DATE_SECOND",
+            "NONINTERACTIVE_SUPPORT_BREAKS",
             "NONINTERACTIVE_SUPPORT_STRATEGY",
             "NONINTERACTIVE_NET_STRATEGY",
         ):
