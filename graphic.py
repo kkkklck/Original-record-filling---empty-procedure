@@ -53,6 +53,9 @@ _ORF = _load_orf_module()
 probe_categories_from_docx = _ORF.probe_categories_from_docx
 export_mode2_noninteractive = _ORF.export_mode2_noninteractive
 run_noninteractive = _ORF.run_noninteractive
+Mode1ConfigProvider = getattr(_ORF, "Mode1ConfigProvider", None)
+run_mode1_with_provider = getattr(_ORF, "run_mode1_with_provider", None)
+export_mode1_noninteractive = getattr(_ORF, "export_mode1_noninteractive", None)
 BACKEND_TITLE = getattr(_ORF, "TITLE", "原始记录自动填写程序")
 ORF_LOADED_FROM = getattr(_ORF, "__file__", None)
 # ===================================
