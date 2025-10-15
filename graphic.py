@@ -226,15 +226,13 @@ class MainWindow(QMainWindow):
         self.box_m2 = QGroupBox("3B. Mode 2（楼层断点）")
         lm2 = QVBoxLayout(self.box_m2)
 
-        row_bp1 = QHBoxLayout()
-        self.lb_bp_gz = QLabel("钢柱断点")
-        self.ed_bp_gz = QLineEdit(); self.ed_bp_gz.setPlaceholderText("例：3 6 10（空=不分段）")
-        row_bp1.addWidget(self.lb_bp_gz); row_bp1.addWidget(self.ed_bp_gz, 1)
-
-        row_bp2 = QHBoxLayout()
-        self.lb_bp_gl = QLabel("钢梁断点")
-        self.ed_bp_gl = QLineEdit(); self.ed_bp_gl.setPlaceholderText("例：3 6 10（空=不分段）")
-        row_bp2.addWidget(self.lb_bp_gl); row_bp2.addWidget(self.ed_bp_gl, 1)
+        row_bp = QHBoxLayout()
+        self.lb_bp_common = QLabel("楼层断点（柱/梁）")
+        self.ed_bp_common = QLineEdit(); self.ed_bp_common.setPlaceholderText("例：3 6 10（空=不分段）")
+        self.lb_bp_hint = QLabel(""); self.lb_bp_hint.setStyleSheet("color:#888;")
+        row_bp.addWidget(self.lb_bp_common)
+        row_bp.addWidget(self.ed_bp_common, 1)
+        row_bp.addWidget(self.lb_bp_hint)
 
         row_dt = QHBoxLayout()
         row_dt.addWidget(QLabel("前段日期"))
@@ -265,14 +263,31 @@ class MainWindow(QMainWindow):
         row_strategy.addWidget(self.cmb_net_strategy)
         row_strategy.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
 
+        row_sup_bp = QHBoxLayout()
+        self.lb_sup_bp = QLabel("支撑断点")
+        self.ed_bp_sup = QLineEdit(); self.ed_bp_sup.setPlaceholderText("例：3 6 10（空=不分段）")
+        row_sup_bp.addWidget(self.lb_sup_bp)
+        row_sup_bp.addWidget(self.ed_bp_sup, 1)
+
         row_go = QHBoxLayout()
         row_go.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
         self.btn_run_m2 = QPushButton("生成（楼层断点）")
         self.btn_run_m2.setFixedSize(QSize(160, 36))
         row_go.addWidget(self.btn_run_m2)
 
-        for r in (row_bp1, row_bp2, row_dt, row_inc, row_strategy, row_go):
+        for r in (row_bp, row_dt, row_inc, row_strategy, row_sup_bp, row_go):
             lm2.addLayout(r)
+
+        self.lb_bp_common.setVisible(False)
+        self.ed_bp_common.setVisible(False)
+        self.lb_bp_hint.setVisible(False)
+        self.lb_sup_bp.setVisible(False)
+        self.ed_bp_sup.setVisible(False)
+        self.ed_bp_sup.setEnabled(False)
+
+        self.ck_support.toggled.connect(lambda on: self.ed_bp_sup.setEnabled(on))
+        self.cmb_sup_strategy.currentIndexChanged.connect(self._update_sup_bp_ui)
+        self._update_sup_bp_ui()
 
         # 容器：只显示当前模式对应的表单
         self.panel_wrap = QVBoxLayout()
@@ -389,14 +404,26 @@ class MainWindow(QMainWindow):
         gz_ok = self.present.get("钢柱", False)
         gl_ok = self.present.get("钢梁", False)
 
-        if not (gz_ok or gl_ok):
+        show_common = gz_ok or gl_ok
+
+        if not show_common:
             self.box_m2.setDisabled(True)
             self.status.setText("⚠ 未识别到钢柱/钢梁，Mode 2 可能不可用。")
         else:
             self.box_m2.setDisabled(False)
 
-        self.lb_bp_gz.setVisible(gz_ok); self.ed_bp_gz.setVisible(gz_ok)
-        self.lb_bp_gl.setVisible(gl_ok); self.ed_bp_gl.setVisible(gl_ok)
+        hint = "未识别到钢柱/钢梁"
+        if gz_ok and gl_ok:
+            hint = "识别到：钢柱 + 钢梁（共用断点）"
+        elif gz_ok:
+            hint = "识别到：钢柱（共用断点）"
+        elif gl_ok:
+            hint = "识别到：钢梁（共用断点）"
+
+        self.lb_bp_hint.setText(hint)
+        self.lb_bp_common.setVisible(show_common)
+        self.ed_bp_common.setVisible(show_common)
+        self.lb_bp_hint.setVisible(show_common)
 
         sup_ok = self.present.get("支撑", False)
         num_sup = self.counts.get("支撑", 0)
@@ -406,14 +433,33 @@ class MainWindow(QMainWindow):
         self.ck_support.setText("支撑" if num_sup == 0 else f"支撑（{num_sup}）")
         self.lb_sup_strategy.setVisible(sup_ok)
         self.cmb_sup_strategy.setVisible(sup_ok)
-        if not sup_ok:
+        self.lb_sup_bp.setVisible(sup_ok)
+        self.ed_bp_sup.setVisible(sup_ok)
+        if sup_ok:
+            self.ed_bp_sup.setEnabled(self.ck_support.isChecked())
+        else:
             self.cmb_sup_strategy.setCurrentIndex(0)
+            self.ed_bp_sup.setEnabled(False)
+            self.ed_bp_sup.clear()
 
         net_ok = self.present.get("网架", False)
         self.lb_net_strategy.setVisible(net_ok)
         self.cmb_net_strategy.setVisible(net_ok)
         if not net_ok:
             self.cmb_net_strategy.setCurrentIndex(0)
+
+        self._update_sup_bp_ui()
+
+    def _update_sup_bp_ui(self):
+        if not hasattr(self, "cmb_sup_strategy"):
+            return
+        if self.cmb_sup_strategy.currentIndex() == 1:
+            self.lb_sup_bp.setText("支撑断点（楼层）")
+            self.ed_bp_sup.setPlaceholderText("例：3 6 10（空=不分段）")
+        else:
+            self.lb_sup_bp.setText("支撑断点（编号）")
+            self.ed_bp_sup.setPlaceholderText("例：10 20 30（空=不分段）")
+
 
     # ====== 返回 Step1 重选文件 ======
     def _go_back_to_select(self):
@@ -445,8 +491,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先选择 Word 源文件。");
             return
 
-        bp_gz = (self.ed_bp_gz.text() or "").strip() if self.ed_bp_gz.isVisible() else ""
-        bp_gl = (self.ed_bp_gl.text() or "").strip() if self.ed_bp_gl.isVisible() else ""
+        bp_common = (self.ed_bp_common.text() or "").strip() if self.ed_bp_common.isVisible() else ""
+        bp_sup = ""
+        if self.ed_bp_sup.isVisible() and self.ed_bp_sup.isEnabled():
+            bp_sup = (self.ed_bp_sup.text() or "").strip()
         dt_first = (self.ed_dt_first.text() or "").strip()
         dt_second = (self.ed_dt_second.text() or "").strip()
 
@@ -468,8 +516,9 @@ class MainWindow(QMainWindow):
             out = export_mode2_noninteractive(
                 src_docx=str(self.doc_path),
                 meta=meta,
-                breaks_gz=bp_gz,
-                breaks_gl=bp_gl,
+                breaks_gz=bp_common,
+                breaks_gl=bp_common,
+                breaks_support=bp_sup,
                 date_first=dt_first,
                 date_second=dt_second,
                 include_support=inc_support,
