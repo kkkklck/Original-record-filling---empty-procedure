@@ -1786,6 +1786,21 @@ def prompt_bucket_priority():
     return ans != 'n'
 
 
+def prompt_later_priority():
+    """供适配层覆盖的“后桶优先”询问接口。"""
+    return prompt_bucket_priority()
+
+
+def prompt_auto_merge_remains(*_, **__):
+    """供适配层覆盖的“是否自动并入剩余构件”接口。默认返回 ``None``。"""
+    return None
+
+
+def prompt_keywords_for_bucket(*_, **__):
+    """供适配层覆盖的关键词输入接口。默认返回 ``None`` 表示继续交互询问。"""
+    return None
+
+
 def prompt_support_strategy_for_bucket():
     """在需要支撑分桶策略时询问一次。"""
     global support_bucket_strategy
@@ -1908,12 +1923,24 @@ def prompt_date_buckets(categories_present, grouped):
             else:
                 txt = ask(f"🏗 {cat} 楼层规则（例：1-3 5 7-10 屋面；留空=不接收；*=不限）：")
                 rules[cat] = parse_rule(txt)
-        kws_txt = ask("🔎 关键词（可多个，空格/逗号分隔；留空=无需）：")
+        kws_prefilled = prompt_keywords_for_bucket(
+            bucket_index=i - 1,
+            rules=rules,
+            categories_present=categories_present,
+        )
+        if kws_prefilled is None:
+            kws_txt = ask("🔎 关键词（可多个，空格/逗号分隔；留空=无需）：")
+            kws = [k for k in re.split(r"[,\s，]+", kws_txt) if k] if kws_txt else []
+        else:
+            if isinstance(kws_prefilled, str):
+                kws = [k for k in re.split(r"[,\s，]+", kws_prefilled) if k]
+            else:
+                kws = [str(k).strip() for k in kws_prefilled if str(k).strip()]
         buckets.append({
             "date_raw": d,
             "date": normalize_date(d) if d else "",
             "rules": rules,
-            "kws": [k for k in re.split(r"[,\s，]+", kws_txt) if k] if kws_txt else []
+            "kws": kws
         })
     return buckets
 
@@ -1941,39 +1968,47 @@ def assign_by_buckets(cat_groups: dict, buckets, later_priority=True):
     cat_byb = {cat: {i: [] for i in range(len(buckets))} for cat in cat_groups}
     assigned = {cat: set() for cat in cat_groups}
     order = range(len(buckets) - 1, -1, -1) if later_priority else range(len(buckets))
+    sup_strategy = (support_bucket_strategy or "number") if support_bucket_strategy else "number"
+    sup_strategy = sup_strategy.lower()
+    net_strategy_default = (net_bucket_strategy or "number") if net_bucket_strategy else "number"
+    net_strategy_default = net_strategy_default.lower()
     for cat, groups in cat_groups.items():
         for idx, g in enumerate(groups):
             # 计算匹配
             fl = floor_of(g["name"])
-            wzno = _wz_no(g["name"]) if cat == "支撑" and support_bucket_strategy == "number" else None
+            wzno = _wz_no(g["name"]) if cat == "支撑" and sup_strategy == "number" else None
             for bi in order:
                 b = buckets[bi]
-                rule = b["rules"].get(cat)
+                bucket_rules = (b or {}).get("rules") or {}
+                rule = bucket_rules.get(cat)
                 if not rule:
                     continue
                 if cat != "网架" and not rule.get("enabled"):
                     continue
                 ok = False  # noqa
                 if cat == "支撑":
-                    if support_bucket_strategy == "number":
+                    if sup_strategy == "number":
                         rng = rule["ranges"]
                         ok_num = True if rng == [] else (wzno is not None and _in_ranges(wzno, rng))
                         ok = ok_num
                     else:
                         ok = _in_ranges(fl, rule["ranges"])
                 elif cat == "网架":
+                    parts = (rule or {}).get("parts") or {}
                     part = net_part(g["name"])
-                    part_rule = rule["parts"].get(part) or rule["parts"].get("GEN")
-                    if not (part_rule and part_rule["enabled"]):
+                    part_rule = parts.get(part) or parts.get("GEN")
+                    if not (part_rule and part_rule.get("enabled")):
                         continue
-                    if rule["strategy"] == "number":
+                    bucket_net_strategy = (rule.get("strategy") or net_strategy_default).lower()
+                    if bucket_net_strategy == "number":
                         no = _net_no(g["name"])
                         ok = (no is not None) and _in_ranges(no, part_rule["ranges"])
                     else:
                         ok = _in_ranges(fl, part_rule["ranges"])
                 else:
                     ok = _in_ranges(fl, rule["ranges"])
-                if ok and _match_keywords(g["name"], b["kws"]):
+                kws_list = b.get("kws") if isinstance(b, dict) else None
+                if ok and _match_keywords(g["name"], kws_list):
                     cat_byb[cat][bi].append(g)
                     assigned[cat].add(idx)
                     break
@@ -1981,6 +2016,271 @@ def assign_by_buckets(cat_groups: dict, buckets, later_priority=True):
     remain_by_cat = {cat: [g for i, g in enumerate(groups) if i not in assigned[cat]]
                      for cat, groups in cat_groups.items()}
     return cat_byb, remain_by_cat
+
+
+class Mode1ConfigProvider:
+    """前端配置适配层，提供 Mode 1 所需的结构化配置。"""
+
+    def __init__(
+            self,
+            buckets,
+            support_strategy,
+            net_strategy,
+            later_priority,
+            auto_merge_rest,
+            meta=None,
+    ):
+        self.raw_buckets = list(buckets or [])
+        self.support_strategy = (support_strategy or "number").lower()
+        self.net_strategy = (net_strategy or "number").lower()
+        self.later_priority = bool(later_priority)
+        self.auto_merge_rest = bool(auto_merge_rest)
+        self.meta = dict(meta or {})
+        self._normalized_buckets = [self._normalize_bucket(b) for b in self.raw_buckets]
+
+    def _normalize_bucket(self, bucket):
+        data = dict(bucket or {})
+        date_raw = data.get("date_raw") or data.get("date") or ""
+        kws = self._normalize_keywords(data.get("kws"))
+        normalized = {
+            "date_raw": date_raw,
+            "date": normalize_date(date_raw) if date_raw else "",
+            "rules": {},
+            "kws": kws,
+        }
+        rules_in = data.get("rules") or {}
+        for cat, rule in rules_in.items():
+            if cat == "网架":
+                normalized["rules"][cat] = self._normalize_net_rule(rule)
+            else:
+                normalized_rule = self._normalize_simple_rule(rule)
+                if normalized_rule:
+                    normalized["rules"][cat] = normalized_rule
+        return normalized
+
+    def _normalize_keywords(self, kws):
+        if not kws:
+            return []
+        if isinstance(kws, str):
+            parts = [k for k in re.split(r"[,\s，]+", kws) if k]
+            return parts
+        parts = []
+        for item in kws:
+            s = str(item).strip()
+            if s:
+                parts.append(s)
+        return parts
+
+    def _normalize_simple_rule(self, rule_data):
+        if rule_data is None:
+            return {"enabled": False, "ranges": []}
+        if isinstance(rule_data, dict):
+            enabled_flag = rule_data.get("enabled")
+            ranges_raw = rule_data.get("ranges")
+        else:
+            enabled_flag = True
+            ranges_raw = rule_data
+        enabled_flag = bool(enabled_flag)
+        if not enabled_flag:
+            return {"enabled": False, "ranges": []}
+        ranges = self._coerce_ranges(ranges_raw)
+        if ranges is None:
+            return {"enabled": False, "ranges": []}
+        return {"enabled": True, "ranges": ranges}
+
+    def _coerce_ranges(self, ranges_raw):
+        if isinstance(ranges_raw, list):
+            return list(ranges_raw)
+        s = str(ranges_raw or "").strip()
+        if not s:
+            return None
+        if _is_lk(s):
+            return []
+        if s in ("*", "＊"):
+            return []
+        return _parse_int_ranges(s)
+
+    def _normalize_net_rule(self, rule):
+        data = dict(rule or {})
+        strategy = (data.get("strategy") or self.net_strategy or "number").lower()
+        parts_in = data.get("parts") or {}
+        parts_out = {}
+        for part, part_rule in parts_in.items():
+            parts_out[part] = self._normalize_simple_rule(part_rule)
+        return {"strategy": strategy, "parts": parts_out}
+
+    def get_buckets(self):
+        """返回深拷贝的规范化桶配置，供 run_mode 使用。"""
+        return copy.deepcopy(self._normalized_buckets)
+
+
+def run_mode1_with_provider(src_docx, out_dir, provider: "Mode1ConfigProvider"):
+    """以适配层提供的数据运行 Mode1，无需交互。"""
+
+    if provider is None:
+        raise ValueError("provider 不能为空")
+
+    src = Path(str(src_docx)).resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"未找到 Word 源文件：{src}")
+
+    out_dir = Path(out_dir) if out_dir is not None else src.parent
+    out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_src = _PROBE_CACHE.get("src")
+    grouped = None
+    categories_present = None
+    if cache_src and Path(str(cache_src)).resolve() == src:
+        grouped = _PROBE_CACHE.get("grouped") or defaultdict(list)
+        categories_present = list(_PROBE_CACHE.get("categories") or [])
+    if grouped is None or categories_present is None:
+        grouped, categories_present = prepare_from_word(src)
+    else:
+        if not isinstance(grouped, defaultdict):
+            tmp = defaultdict(list)
+            for k, v in (grouped or {}).items():
+                tmp[k] = list(v)
+            grouped = tmp
+
+    tpl_path = XLSX_WITH_SUPPORT_DEFAULT
+    if not tpl_path.exists():
+        raise FileNotFoundError(f"Excel 模板不存在：{tpl_path}")
+    wb = load_workbook_safe(tpl_path)
+
+    buckets = provider.get_buckets()
+
+    _pd = globals().get("prompt_date_buckets")
+    _ps = globals().get("prompt_support_strategy_for_bucket")
+    _pn = globals().get("prompt_net_strategy_for_bucket")
+    _pl = globals().get("prompt_later_priority")
+    _pa = globals().get("prompt_auto_merge_remains")
+    _pk = globals().get("prompt_keywords_for_bucket")
+
+    def __pd(*_, **__):
+        return buckets
+
+    def __ps(*_, **__):
+        set_support_strategy(provider.support_strategy)
+        return provider.support_strategy
+
+    def __pn(*_, **__):
+        set_net_strategy(provider.net_strategy)
+        return provider.net_strategy
+
+    def __pl(*_, **__):
+        return provider.later_priority
+
+    def __pa(*_, **__):
+        return provider.auto_merge_rest
+
+    def __pk(*_, **__):
+        return []
+
+    try:
+        globals()["prompt_date_buckets"] = __pd
+        globals()["prompt_support_strategy_for_bucket"] = __ps
+        globals()["prompt_net_strategy_for_bucket"] = __pn
+        globals()["prompt_later_priority"] = __pl
+        globals()["prompt_auto_merge_remains"] = __pa
+        globals()["prompt_keywords_for_bucket"] = __pk
+
+        used_pages = run_mode(
+            "1",
+            wb,
+            categories_present=categories_present,
+            grouped_preloaded=grouped,
+        )
+    finally:
+        if _pd is not None:
+            globals()["prompt_date_buckets"] = _pd
+        if _ps is not None:
+            globals()["prompt_support_strategy_for_bucket"] = _ps
+        if _pn is not None:
+            globals()["prompt_net_strategy_for_bucket"] = _pn
+        if _pl is not None:
+            globals()["prompt_later_priority"] = _pl
+        if _pa is not None:
+            globals()["prompt_auto_merge_remains"] = _pa
+        if _pk is not None:
+            globals()["prompt_keywords_for_bucket"] = _pk
+        set_support_strategy(None)
+        set_net_strategy(None)
+
+    meta = provider.meta or {}
+    apply_meta_fixed(wb, categories_present, meta)
+    enforce_mu_font(wb)
+    cleanup_unused_sheets(wb, used_pages, bases=tuple(CATEGORY_ORDER))
+
+    def _unique_out_path(dest_dir: Path, stem: str) -> Path:
+        cand = dest_dir / f"{stem}.xlsx"
+        if not cand.exists():
+            return cand
+        i = 1
+        while True:
+            cand = dest_dir / f"{stem}({i}).xlsx"
+            if not cand.exists():
+                return cand
+            i += 1
+
+    final_path = _unique_out_path(out_dir, f"{TITLE}_报告版")
+    save_workbook_safe(wb, final_path)
+
+    word_out = src.with_name("汇总原始记录.docx")
+    if not word_out.exists():
+        all_rows = _PROBE_CACHE.get("all_rows")
+        if all_rows:
+            try:
+                doc_out = build_summary_doc_with_progress(all_rows)
+                set_doc_font_progress(doc_out, DEFAULT_FONT_PT)
+                save_docx_safe(doc_out, word_out)
+            except Exception:
+                pass
+    return final_path, word_out
+
+
+def set_support_strategy(strategy: str | None):
+    """设置全局支撑分桶策略。"""
+    global support_bucket_strategy
+    if strategy is None:
+        support_bucket_strategy = None
+        return
+    val = str(strategy).strip().lower()
+    if val not in {"number", "floor"}:
+        raise ValueError("support_strategy 必须是 'number' 或 'floor'")
+    support_bucket_strategy = val
+
+
+def set_net_strategy(strategy: str | None):
+    """设置全局网架分桶策略。"""
+    global net_bucket_strategy
+    if strategy is None:
+        net_bucket_strategy = None
+        return
+    val = str(strategy).strip().lower()
+    if val not in {"number", "floor"}:
+        raise ValueError("net_strategy 必须是 'number' 或 'floor'")
+    net_bucket_strategy = val
+
+
+def merge_remains_into_last_bucket(cats_by_bucket: dict, remain_by_cat: dict):
+    """把未分配的数据并入最后一个桶。"""
+    if not cats_by_bucket:
+        return
+    last_idx = None
+    for bucket_map in cats_by_bucket.values():
+        if bucket_map:
+            cur_max = max(bucket_map.keys())
+            last_idx = cur_max if last_idx is None else max(last_idx, cur_max)
+    if last_idx is None:
+        last_idx = 0
+    for cat, remain in (remain_by_cat or {}).items():
+        bucket_map = cats_by_bucket.setdefault(cat, {})
+        if last_idx not in bucket_map:
+            bucket_map[last_idx] = []
+        bucket_map[last_idx].extend(remain)
+        if hasattr(remain, "clear"):
+            remain.clear()
 
 
 def preview_buckets_generic(cat_byb, remain_by_cat, buckets, categories_present):
@@ -2931,15 +3231,25 @@ def run_mode(
         if buckets is None:
             return
 
-        later_first = prompt_bucket_priority()
+        later_first = prompt_later_priority()
         cat_byb, remain_by_cat = assign_by_buckets(grouped_data, buckets, later_first)
-        ok, auto_last = preview_buckets_generic(cat_byb, remain_by_cat, buckets, categories_present)
+        ok, auto_last_preview = preview_buckets_generic(cat_byb, remain_by_cat, buckets, categories_present)
         if not ok:
             return
 
+        forced_choice = prompt_auto_merge_remains(
+            remain_by_cat=remain_by_cat,
+            buckets=buckets,
+            categories_present=categories_present,
+            preview_choice=auto_last_preview,
+        )
+        auto_last = bool(auto_last_preview)
+        forced_provided = forced_choice is not None
+        if forced_provided:
+            auto_last = bool(forced_choice)
+
         unassigned = sum(len(v) for v in remain_by_cat.values())
-        # 若在预览阶段已选择 `a` 自动并入最后一天，则此处无需再次询问
-        if unassigned and not auto_last:
+        if unassigned and not auto_last and not forced_provided:
             print(f"⚠️ 未指派：{unassigned} 组")
             auto = ask("是否自动把未指派并入最后一天？（y=是 / 其它=否）", allow_empty=False, lower=True)
             if auto == "y":
@@ -3197,6 +3507,150 @@ def run_noninteractive(
     # 9) 返回路径
     word_out = src.with_name("汇总原始记录.docx")
     return {"excel": final_xlsx, "word": word_out}
+
+
+def export_mode1_noninteractive(
+        src_docx,
+        out_dir=None,
+        *,
+        buckets,
+        support_strategy="number",
+        net_strategy="number",
+        later_priority=True,
+        auto_merge_rest=True,
+        meta=None,
+):
+    """纯无交互导出 Mode1。"""
+
+    provider = Mode1ConfigProvider(
+        buckets,
+        support_strategy,
+        net_strategy,
+        later_priority,
+        auto_merge_rest,
+        meta=meta,
+    )
+
+    src = Path(str(src_docx)).resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"未找到 Word 源文件：{src}")
+
+    out_dir = Path(out_dir) if out_dir is not None else src.parent
+    out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_src = _PROBE_CACHE.get("src")
+    grouped = None
+    categories_present = None
+    if cache_src and Path(str(cache_src)).resolve() == src:
+        grouped = _PROBE_CACHE.get("grouped") or defaultdict(list)
+        categories_present = list(_PROBE_CACHE.get("categories") or [])
+    if grouped is None or categories_present is None:
+        grouped, categories_present = prepare_from_word(src)
+    else:
+        if not isinstance(grouped, defaultdict):
+            tmp = defaultdict(list)
+            for k, v in (grouped or {}).items():
+                tmp[k] = list(v)
+            grouped = tmp
+
+    categories_present = [cat for cat in CATEGORY_ORDER if grouped.get(cat)]
+
+    tpl_path = XLSX_WITH_SUPPORT_DEFAULT
+    if not tpl_path.exists():
+        raise FileNotFoundError(f"Excel 模板不存在：{tpl_path}")
+    wb = load_workbook_safe(tpl_path)
+
+    prev_support = support_bucket_strategy
+    prev_net = net_bucket_strategy
+    set_support_strategy(provider.support_strategy)
+    set_net_strategy(provider.net_strategy)
+
+    buckets_norm = provider.get_buckets()
+    try:
+        cat_byb, remain_by_cat = assign_by_buckets(grouped, buckets_norm, provider.later_priority)
+    finally:
+        set_support_strategy(prev_support)
+        set_net_strategy(prev_net)
+
+    if provider.auto_merge_rest:
+        merge_remains_into_last_bucket(cat_byb, remain_by_cat)
+
+    blocks_by_cat_bucket = expand_blocks_by_bucket(cat_byb)
+
+    pages_slices_by_cat = {}
+    blocks_slices_by_cat = {}
+    for cat in categories_present:
+        bucket_map = blocks_by_cat_bucket.get(cat, {})
+        pages_slices, blocks_slices = ensure_pages_slices_for_cat_muaware(wb, cat, bucket_map)
+        pages_slices_by_cat[cat] = [_filter_pages_for_cat(sl, cat) for sl in pages_slices]
+        blocks_slices_by_cat[cat] = blocks_slices
+
+    num_days = len(buckets_norm)
+    target = []
+    for i in range(num_days):
+        for cat in CATEGORY_ORDER:
+            if cat in categories_present:
+                target += pages_slices_by_cat[cat][i]
+
+    for idx, name in enumerate(target):
+        cur = wb.sheetnames.index(name)
+        if cur != idx:
+            wb.move_sheet(wb[name], idx - cur)
+
+    total_blocks = 0
+    for cat in categories_present:
+        total_blocks += sum(len(v) for v in blocks_by_cat_bucket.get(cat, {}).values())
+    prog = Prog(total_blocks, "写入 Excel")
+
+    for day_idx in range(num_days):
+        day_pages = []
+        day_blocks = []
+        for cat in CATEGORY_ORDER:
+            if cat in categories_present:
+                day_pages += pages_slices_by_cat[cat][day_idx]
+                day_blocks += blocks_slices_by_cat[cat][day_idx]
+        fill_blocks_to_pages(wb, day_pages, day_blocks, prog)
+        raw = buckets_norm[day_idx].get("date_raw") or buckets_norm[day_idx].get("date") or ""
+        try:
+            dt = _normalize_date(raw) if raw else ""
+        except Exception:
+            dt = (buckets_norm[day_idx].get("date") or "").strip()
+        apply_meta_on_pages(wb, day_pages, dt)
+
+    prog.finish()
+
+    cleanup_unused_mu_templates(wb, target)
+    apply_meta_fixed(wb, categories_present, provider.meta)
+    enforce_mu_font(wb)
+    cleanup_unused_sheets(wb, target, bases=tuple(CATEGORY_ORDER))
+
+    def _unique_out_path(dest_dir: Path, stem: str) -> Path:
+        cand = dest_dir / f"{stem}.xlsx"
+        if not cand.exists():
+            return cand
+        i = 1
+        while True:
+            cand = dest_dir / f"{stem}({i}).xlsx"
+            if not cand.exists():
+                return cand
+            i += 1
+
+    final_xlsx = _unique_out_path(out_dir, f"{TITLE}_报告版")
+    save_workbook_safe(wb, final_xlsx)
+
+    word_out = src.with_name("汇总原始记录.docx")
+    if not word_out.exists():
+        all_rows = _PROBE_CACHE.get("all_rows")
+        if all_rows:
+            try:
+                doc_out = build_summary_doc_with_progress(all_rows)
+                set_doc_font_progress(doc_out, DEFAULT_FONT_PT)
+                save_docx_safe(doc_out, word_out)
+            except Exception:
+                pass
+
+    return final_xlsx, word_out
 
 
 # ===== 非交互：按楼层断点（Mode 2）导出 =====
