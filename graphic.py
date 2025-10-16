@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
     QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QRadioButton, QButtonGroup,
     QCheckBox, QMessageBox, QSpacerItem, QSizePolicy, QStackedWidget, QFrame,
-    QComboBox,
+    QComboBox, QScrollArea, QSpinBox,
 )
 
 
@@ -151,6 +151,7 @@ class MainWindow(QMainWindow):
         self.doc_path: Path | None = None
         self.present = {k: False for k in CANON_KEYS}
         self.counts  = {k: 0 for k in CANON_KEYS}
+        self._m1_day_forms: list[dict] = []
 
         self.stack = QStackedWidget()
         self.page_select = self._build_page_select()
@@ -218,38 +219,22 @@ class MainWindow(QMainWindow):
         lm.addStretch(1)
         lay.addWidget(mode_box)
 
-        def _mk_rule_row(label_text: str, placeholder: str = ""):
-            row = QWidget()
-            row_lay = QHBoxLayout(row)
-            row_lay.setContentsMargins(0, 0, 0, 0)
-            row_lay.setSpacing(8)
-            lb = QLabel(label_text)
-            lb.setMinimumWidth(120)
-            row_lay.addWidget(lb)
-            edit = QLineEdit()
-            if placeholder:
-                edit.setPlaceholderText(placeholder)
-            row_lay.addWidget(edit, 1)
-            return row, edit, lb
-
         # (C) Mode 1 表单
         self.box_m1 = QGroupBox("3A. Mode 1（日期分桶）")
         lm1 = QVBoxLayout(self.box_m1)
+        lm1.setSpacing(12)
 
-        row_dates = QWidget()
-        ld = QHBoxLayout(row_dates)
-        ld.setContentsMargins(0, 0, 0, 0)
-        ld.setSpacing(8)
-        ld.addWidget(QLabel("日期列表"))
-        self.ed_m1_dates = QLineEdit()
-        self.ed_m1_dates.setPlaceholderText("支持 2025-10-13 / 20251013 / 10-13 / 2025年10月13日，空格或逗号分隔")
-        ld.addWidget(self.ed_m1_dates, 1)
-        lm1.addWidget(row_dates)
-
-        self.row_m1_strategy = QWidget()
-        ls = QHBoxLayout(self.row_m1_strategy)
-        ls.setContentsMargins(0, 0, 0, 0)
-        ls.setSpacing(12)
+        bar = QWidget()
+        lb = QHBoxLayout(bar)
+        lb.setContentsMargins(0, 0, 0, 0)
+        lb.setSpacing(12)
+        lb.addWidget(QLabel("天数"))
+        self.sp_m1_days = QSpinBox()
+        self.sp_m1_days.setRange(1, 30)
+        self.sp_m1_days.setValue(1)
+        self.sp_m1_days.setFixedWidth(80)
+        lb.addWidget(self.sp_m1_days)
+        lb.addSpacing(12)
         self.lb_m1_sup = QLabel("支撑分桶")
         self.cmb_m1_sup = QComboBox()
         self.cmb_m1_sup.addItems(["编号", "楼层"])
@@ -259,29 +244,18 @@ class MainWindow(QMainWindow):
         self.cmb_m1_net.addItems(["编号", "楼层"])
         self.cmb_m1_net.setCurrentIndex(0)
         for wdg in (self.lb_m1_sup, self.cmb_m1_sup, self.lb_m1_net, self.cmb_m1_net):
-            ls.addWidget(wdg)
-        ls.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
-        lm1.addWidget(self.row_m1_strategy)
+            lb.addWidget(wdg)
+        lb.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        lm1.addWidget(bar)
 
-        placeholder_rule = "例：1-3 5 屋面；空=不接收，* 或 全部=全接收"
-        self.row_gz, self.ed_m1_rule_gz, _ = _mk_rule_row("钢柱 规则", placeholder_rule)
-        self.row_gl, self.ed_m1_rule_gl, _ = _mk_rule_row("钢梁 规则", placeholder_rule)
-        self.row_sup, self.ed_m1_rule_sup, _ = _mk_rule_row("支撑 规则", placeholder_rule)
-        lm1.addWidget(self.row_gz)
-        lm1.addWidget(self.row_gl)
-        lm1.addWidget(self.row_sup)
-
-        self.row_wj = QWidget()
-        lwj = QVBoxLayout(self.row_wj)
-        lwj.setContentsMargins(0, 0, 0, 0)
-        lwj.setSpacing(6)
-        self.row_wj_xx, self.ed_m1_rule_wj_xx, _ = _mk_rule_row("网架（XX）", placeholder_rule)
-        self.row_wj_fg, self.ed_m1_rule_wj_fg, _ = _mk_rule_row("网架（FG）", placeholder_rule)
-        self.row_wj_sx, self.ed_m1_rule_wj_sx, _ = _mk_rule_row("网架（SX）", placeholder_rule)
-        self.row_wj_gen, self.ed_m1_rule_wj_gen, _ = _mk_rule_row("网架（泛称）", placeholder_rule)
-        for sub in (self.row_wj_xx, self.row_wj_fg, self.row_wj_sx, self.row_wj_gen):
-            lwj.addWidget(sub)
-        lm1.addWidget(self.row_wj)
+        self.scroll_m1_days = QScrollArea()
+        self.scroll_m1_days.setWidgetResizable(True)
+        self._m1_days_container = QWidget()
+        self._m1_days_layout = QVBoxLayout(self._m1_days_container)
+        self._m1_days_layout.setContentsMargins(0, 0, 0, 0)
+        self._m1_days_layout.setSpacing(10)
+        self.scroll_m1_days.setWidget(self._m1_days_container)
+        lm1.addWidget(self.scroll_m1_days, 1)
 
         row_opts = QWidget()
         lo = QHBoxLayout(row_opts)
@@ -411,6 +385,7 @@ class MainWindow(QMainWindow):
         # 事件
         self.btn_back.clicked.connect(self._go_back_to_select)
         self.grp_mode.idToggled.connect(self._on_mode_switched)
+        self.sp_m1_days.valueChanged.connect(self._on_days_changed)
         self.btn_run_m1.clicked.connect(self._on_run_mode1)
         self.btn_run_m2.clicked.connect(self._on_run_mode2)
         self.btn_run_m3.clicked.connect(self._on_run_mode3)
@@ -510,46 +485,100 @@ class MainWindow(QMainWindow):
             if self.present.get(k, False):
                 num = self.counts.get(k, 0)
                 parts.append(f"{k}（{num}）" if num else f"{k}")
-            self.lb_found.setText("、".join(parts) if parts else "未识别到有效构件")
+        self.lb_found.setText("、".join(parts) if parts else "未识别到有效构件")
 
     def _apply_detection_to_mode1_ui(self):
-            if not hasattr(self, "row_gz"):
-                return
+        if not hasattr(self, "sp_m1_days"):
+            return
 
-            gz_ok = self.present.get("钢柱", False)
-            gl_ok = self.present.get("钢梁", False)
-            sup_ok = self.present.get("支撑", False)
-            net_ok = self.present.get("网架", False)
+        sup_ok = self.present.get("支撑", False)
+        net_ok = self.present.get("网架", False)
 
-            self.row_gz.setVisible(gz_ok)
-            if not gz_ok:
-                self.ed_m1_rule_gz.clear()
+        self.lb_m1_sup.setVisible(sup_ok)
+        self.cmb_m1_sup.setVisible(sup_ok)
+        if not sup_ok:
+            self.cmb_m1_sup.setCurrentIndex(0)
 
-            self.row_gl.setVisible(gl_ok)
-            if not gl_ok:
-                self.ed_m1_rule_gl.clear()
+        self.lb_m1_net.setVisible(net_ok)
+        self.cmb_m1_net.setVisible(net_ok)
+        if not net_ok:
+            self.cmb_m1_net.setCurrentIndex(0)
 
-            self.row_sup.setVisible(sup_ok)
-            self.lb_m1_sup.setVisible(sup_ok)
-            self.cmb_m1_sup.setVisible(sup_ok)
-            if not sup_ok:
-                self.cmb_m1_sup.setCurrentIndex(0)
-                self.ed_m1_rule_sup.clear()
+        self._rebuild_m1_day_forms(self.sp_m1_days.value())
 
-            self.lb_m1_net.setVisible(net_ok)
-            self.cmb_m1_net.setVisible(net_ok)
-            self.row_wj.setVisible(net_ok)
-            if not net_ok:
-                self.cmb_m1_net.setCurrentIndex(0)
-                for edit in (
-                        self.ed_m1_rule_wj_xx,
-                        self.ed_m1_rule_wj_fg,
-                        self.ed_m1_rule_wj_sx,
-                        self.ed_m1_rule_wj_gen,
-                ):
-                    edit.clear()
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+                continue
+            child_layout = item.layout()
+            if child_layout is not None:
+                self._clear_layout(child_layout)
 
-            self.row_m1_strategy.setVisible(sup_ok or net_ok)
+    def _on_days_changed(self, n: int):
+        self._rebuild_m1_day_forms(n)
+
+    def _rebuild_m1_day_forms(self, n: int):
+        if not hasattr(self, "_m1_days_layout"):
+            return
+
+        self._clear_layout(self._m1_days_layout)
+        self._m1_day_forms = []
+
+        rule_placeholder = "例：1-3 5 屋面；* 或 全部=全接收；空=不接收"
+        date_placeholder = "支持 2025-10-16 / 20251016 / 10-16 / 2025年10月16日"
+
+        for idx in range(max(0, n)):
+            box = QGroupBox(f"Day #{idx + 1}")
+            box_lay = QVBoxLayout(box)
+            box_lay.setContentsMargins(12, 12, 12, 12)
+            box_lay.setSpacing(10)
+
+            def add_rule_row(label_text: str, placeholder: str = "") -> QLineEdit:
+                row = QWidget()
+                row_lay = QHBoxLayout(row)
+                row_lay.setContentsMargins(0, 0, 0, 0)
+                row_lay.setSpacing(8)
+                lb = QLabel(label_text)
+                lb.setMinimumWidth(120)
+                row_lay.addWidget(lb, 0)
+                edit = QLineEdit()
+                if placeholder:
+                    edit.setPlaceholderText(placeholder)
+                row_lay.addWidget(edit, 1)
+                box_lay.addWidget(row)
+                return edit
+
+            ed_date = add_rule_row("日期", date_placeholder)
+            form_entry: dict[str, QLineEdit] = {"date": ed_date}
+
+            for part in ("钢柱", "钢梁", "支撑"):
+                if self.present.get(part, False):
+                    form_entry[part] = add_rule_row(f"{part} 规则", rule_placeholder)
+
+            if self.present.get("网架", False):
+                form_entry["网架_xx"] = add_rule_row("网架（XX）", rule_placeholder)
+                form_entry["网架_fg"] = add_rule_row("网架（FG）", rule_placeholder)
+                form_entry["网架_sx"] = add_rule_row("网架（SX）", rule_placeholder)
+                form_entry["网架_gen"] = add_rule_row("网架（泛称）", rule_placeholder)
+
+            self._m1_days_layout.addWidget(box)
+            self._m1_day_forms.append(form_entry)
+
+        self._m1_days_layout.addSpacerItem(
+            QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding)
+        )
+
+    @staticmethod
+    def _to_rule(value: str) -> dict:
+        text = (value or "").strip()
+        if not text:
+            return {"enabled": False, "ranges": []}
+        if text in {"*", "＊", "全部", "所有"}:
+            return {"enabled": True, "ranges": []}
+        return {"enabled": True, "ranges": text}
 
     def _apply_detection_to_mode2_ui(self):
         gz_ok = self.present.get("钢柱", False)
@@ -632,36 +661,30 @@ class MainWindow(QMainWindow):
 
     # ====== Mode 1：日期分桶 ======
     def _collect_mode1_buckets(self) -> list[dict]:
-        raw = (self.ed_m1_dates.text() or "").strip()
-        dates = [t for t in re.split(r"[,\s，、]+", raw) if t]
+        buckets: list[dict] = []
+        if not self._m1_day_forms:
+            return buckets
 
-        def to_rule(s: str):
-            s = (s or "").strip()
-            if not s or s.lower() == "lk":
-                return {"enabled": False, "ranges": []}
-            if s in ("*", "＊", "全部", "所有"):
-                return {"enabled": True, "ranges": []}
-            return {"enabled": True, "ranges": s}
+        for form in self._m1_day_forms:
+            date_str = form["date"].text().strip()
+            parts: dict[str, object] = {}
 
-        rules_common: dict[str, object] = {}
-        if self.row_gz.isVisible():
-            rules_common["钢柱"] = to_rule(self.ed_m1_rule_gz.text())
-        if self.row_gl.isVisible():
-            rules_common["钢梁"] = to_rule(self.ed_m1_rule_gl.text())
-        if self.row_sup.isVisible():
-            rules_common["支撑"] = to_rule(self.ed_m1_rule_sup.text())
-        if self.row_wj.isVisible():
-            rules_common["网架"] = {
-                "strategy": "floor" if self.cmb_m1_net.currentIndex() == 1 else "number",
-                "parts": {
-                    "XX": to_rule(self.ed_m1_rule_wj_xx.text()),
-                    "FG": to_rule(self.ed_m1_rule_wj_fg.text()),
-                    "SX": to_rule(self.ed_m1_rule_wj_sx.text()),
-                    "GEN": to_rule(self.ed_m1_rule_wj_gen.text()),
-                },
-            }
+            if "钢柱" in form:
+                parts["钢柱"] = self._to_rule(form["钢柱"].text())
+            if "钢梁" in form:
+                parts["钢梁"] = self._to_rule(form["钢梁"].text())
+            if "支撑" in form:
+                parts["支撑"] = self._to_rule(form["支撑"].text())
+            if "网架_xx" in form:
+                parts["网架"] = {
+                    "XX": self._to_rule(form["网架_xx"].text()),
+                    "FG": self._to_rule(form["网架_fg"].text()),
+                    "SX": self._to_rule(form["网架_sx"].text()),
+                    "GEN": self._to_rule(form["网架_gen"].text()),
+                }
 
-        buckets = [{"date_raw": d, "rules": copy.deepcopy(rules_common), "kws": []} for d in dates]
+            buckets.append({"date": date_str, "parts": parts})
+
         return buckets
 
     def _on_run_mode1(self):
@@ -674,7 +697,22 @@ class MainWindow(QMainWindow):
 
         buckets = self._collect_mode1_buckets()
         if not buckets:
-            QMessageBox.warning(self, "提示", "请至少输入一个日期。")
+            QMessageBox.warning(self, "提示", "请至少填写一天数据。")
+            return
+
+        def _has_content(bucket: dict) -> bool:
+            if bucket.get("date"):
+                return True
+            for key, value in bucket.get("parts", {}).items():
+                if key == "网架":
+                    if any(part.get("enabled") for part in value.values()):
+                        return True
+                elif value.get("enabled"):
+                    return True
+            return False
+
+        if not any(_has_content(b) for b in buckets):
+            QMessageBox.warning(self, "提示", "请至少填写一天数据。")
             return
 
         support_strategy = "floor" if self.cmb_m1_sup.isVisible() and self.cmb_m1_sup.currentIndex() == 1 else "number"
