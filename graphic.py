@@ -7,7 +7,7 @@
 #   - 改进：Mode2 的“可包含”行带数量，复选框采用蓝色勾选样式，更显眼
 
 from __future__ import annotations
-import os, sys, importlib.util
+import os, sys, importlib.util, re, copy
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -206,13 +206,103 @@ class MainWindow(QMainWindow):
         # (B) 模式选择
         mode_box = QGroupBox("2. 选择处理模式")
         lm = QHBoxLayout(mode_box)
-        self.rb_m1 = QRadioButton("Mode 1"); self.rb_m2 = QRadioButton("Mode 2"); self.rb_m3 = QRadioButton("Mode 3"); self.rb_m4 = QRadioButton("Mode 4")
-        self.rb_m2.setChecked(True); self.rb_m1.setEnabled(False); self.rb_m4.setEnabled(False)
+        self.rb_m1 = QRadioButton("Mode 1")
+        self.rb_m2 = QRadioButton("Mode 2")
+        self.rb_m3 = QRadioButton("Mode 3")
+        self.rb_m4 = QRadioButton("Mode 4")
+        self.rb_m2.setChecked(True)
+        self.rb_m4.setEnabled(False)
         self.grp_mode = QButtonGroup(self)
         for i, rb in enumerate([self.rb_m1, self.rb_m2, self.rb_m3, self.rb_m4], start=1):
             self.grp_mode.addButton(rb, i); lm.addWidget(rb)
         lm.addStretch(1)
         lay.addWidget(mode_box)
+
+        def _mk_rule_row(label_text: str, placeholder: str = ""):
+            row = QWidget()
+            row_lay = QHBoxLayout(row)
+            row_lay.setContentsMargins(0, 0, 0, 0)
+            row_lay.setSpacing(8)
+            lb = QLabel(label_text)
+            lb.setMinimumWidth(120)
+            row_lay.addWidget(lb)
+            edit = QLineEdit()
+            if placeholder:
+                edit.setPlaceholderText(placeholder)
+            row_lay.addWidget(edit, 1)
+            return row, edit, lb
+
+        # (C) Mode 1 表单
+        self.box_m1 = QGroupBox("3A. Mode 1（日期分桶）")
+        lm1 = QVBoxLayout(self.box_m1)
+
+        row_dates = QWidget()
+        ld = QHBoxLayout(row_dates)
+        ld.setContentsMargins(0, 0, 0, 0)
+        ld.setSpacing(8)
+        ld.addWidget(QLabel("日期列表"))
+        self.ed_m1_dates = QLineEdit()
+        self.ed_m1_dates.setPlaceholderText("支持 2025-10-13 / 20251013 / 10-13 / 2025年10月13日，空格或逗号分隔")
+        ld.addWidget(self.ed_m1_dates, 1)
+        lm1.addWidget(row_dates)
+
+        self.row_m1_strategy = QWidget()
+        ls = QHBoxLayout(self.row_m1_strategy)
+        ls.setContentsMargins(0, 0, 0, 0)
+        ls.setSpacing(12)
+        self.lb_m1_sup = QLabel("支撑分桶")
+        self.cmb_m1_sup = QComboBox()
+        self.cmb_m1_sup.addItems(["编号", "楼层"])
+        self.cmb_m1_sup.setCurrentIndex(0)
+        self.lb_m1_net = QLabel("网架分桶")
+        self.cmb_m1_net = QComboBox()
+        self.cmb_m1_net.addItems(["编号", "楼层"])
+        self.cmb_m1_net.setCurrentIndex(0)
+        for wdg in (self.lb_m1_sup, self.cmb_m1_sup, self.lb_m1_net, self.cmb_m1_net):
+            ls.addWidget(wdg)
+        ls.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        lm1.addWidget(self.row_m1_strategy)
+
+        placeholder_rule = "例：1-3 5 屋面；空=不接收，* 或 全部=全接收"
+        self.row_gz, self.ed_m1_rule_gz, _ = _mk_rule_row("钢柱 规则", placeholder_rule)
+        self.row_gl, self.ed_m1_rule_gl, _ = _mk_rule_row("钢梁 规则", placeholder_rule)
+        self.row_sup, self.ed_m1_rule_sup, _ = _mk_rule_row("支撑 规则", placeholder_rule)
+        lm1.addWidget(self.row_gz)
+        lm1.addWidget(self.row_gl)
+        lm1.addWidget(self.row_sup)
+
+        self.row_wj = QWidget()
+        lwj = QVBoxLayout(self.row_wj)
+        lwj.setContentsMargins(0, 0, 0, 0)
+        lwj.setSpacing(6)
+        self.row_wj_xx, self.ed_m1_rule_wj_xx, _ = _mk_rule_row("网架（XX）", placeholder_rule)
+        self.row_wj_fg, self.ed_m1_rule_wj_fg, _ = _mk_rule_row("网架（FG）", placeholder_rule)
+        self.row_wj_sx, self.ed_m1_rule_wj_sx, _ = _mk_rule_row("网架（SX）", placeholder_rule)
+        self.row_wj_gen, self.ed_m1_rule_wj_gen, _ = _mk_rule_row("网架（泛称）", placeholder_rule)
+        for sub in (self.row_wj_xx, self.row_wj_fg, self.row_wj_sx, self.row_wj_gen):
+            lwj.addWidget(sub)
+        lm1.addWidget(self.row_wj)
+
+        row_opts = QWidget()
+        lo = QHBoxLayout(row_opts)
+        lo.setContentsMargins(0, 0, 0, 0)
+        lo.setSpacing(16)
+        self.ck_m1_later = QCheckBox("后面的日期优先（推荐）")
+        self.ck_m1_later.setChecked(True)
+        self.ck_m1_merge = QCheckBox("未分配并入最后一天")
+        lo.addWidget(self.ck_m1_later)
+        lo.addWidget(self.ck_m1_merge)
+        lo.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        lm1.addWidget(row_opts)
+
+        row_go_m1 = QWidget()
+        lg = QHBoxLayout(row_go_m1)
+        lg.setContentsMargins(0, 0, 0, 0)
+        lg.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        self.btn_run_m1 = QPushButton("生成（日期分桶）")
+        self.btn_run_m1.setFixedSize(QSize(180, 36))
+        lg.addWidget(self.btn_run_m1)
+        lm1.addWidget(row_go_m1)
 
         # (C) Mode 3 表单
         self.box_m3 = QGroupBox("3A. Mode 3（单日模式）")
@@ -304,12 +394,15 @@ class MainWindow(QMainWindow):
 
         # 容器：只显示当前模式对应的表单
         self.panel_wrap = QVBoxLayout()
+        self.panel_wrap.addWidget(self.box_m1)
         self.panel_wrap.addWidget(self.box_m2)  # 默认显示 M2
         self.panel_wrap.addWidget(self.box_m3)
+        self.box_m1.setVisible(False)
         self.box_m3.setVisible(False)
 
         lay.addLayout(self.panel_wrap)
         lay.addStretch(1)
+
 
         lay.addWidget(hline())
         self.status = QLabel("准备就绪"); self.status.setStyleSheet("color:#555;")
@@ -318,8 +411,11 @@ class MainWindow(QMainWindow):
         # 事件
         self.btn_back.clicked.connect(self._go_back_to_select)
         self.grp_mode.idToggled.connect(self._on_mode_switched)
+        self.btn_run_m1.clicked.connect(self._on_run_mode1)
         self.btn_run_m2.clicked.connect(self._on_run_mode2)
         self.btn_run_m3.clicked.connect(self._on_run_mode3)
+
+        self._apply_detection_to_mode1_ui()
 
         return w
 
@@ -391,6 +487,7 @@ class MainWindow(QMainWindow):
         self.present, self.counts = normalize_detected(res.categories, res.counts)
 
         # 切到 Step 2，并按检索结果刷新 UI
+        self._apply_detection_to_mode1_ui()
         self._apply_detection_to_mode2_ui()
         self._refresh_found_bar()
         self.lb_file_short.setText(f"文件：{self.doc_path.name}")
@@ -401,9 +498,10 @@ class MainWindow(QMainWindow):
     def _on_mode_switched(self, _id: int, checked: bool):
         if not checked:
             return
-        m2 = (self.grp_mode.checkedButton() is self.rb_m2)
-        self.box_m2.setVisible(m2)
-        self.box_m3.setVisible(not m2)
+        current = self.grp_mode.checkedButton()
+        self.box_m1.setVisible(current is self.rb_m1)
+        self.box_m2.setVisible(current is self.rb_m2)
+        self.box_m3.setVisible(current is self.rb_m3)
 
     # 顶部“识别结果”标签条
     def _refresh_found_bar(self):
@@ -412,7 +510,47 @@ class MainWindow(QMainWindow):
             if self.present.get(k, False):
                 num = self.counts.get(k, 0)
                 parts.append(f"{k}（{num}）" if num else f"{k}")
-        self.lb_found.setText("、".join(parts) if parts else "未识别到有效构件")
+            self.lb_found.setText("、".join(parts) if parts else "未识别到有效构件")
+
+    def _apply_detection_to_mode1_ui(self):
+            if not hasattr(self, "row_gz"):
+                return
+
+            gz_ok = self.present.get("钢柱", False)
+            gl_ok = self.present.get("钢梁", False)
+            sup_ok = self.present.get("支撑", False)
+            net_ok = self.present.get("网架", False)
+
+            self.row_gz.setVisible(gz_ok)
+            if not gz_ok:
+                self.ed_m1_rule_gz.clear()
+
+            self.row_gl.setVisible(gl_ok)
+            if not gl_ok:
+                self.ed_m1_rule_gl.clear()
+
+            self.row_sup.setVisible(sup_ok)
+            self.lb_m1_sup.setVisible(sup_ok)
+            self.cmb_m1_sup.setVisible(sup_ok)
+            if not sup_ok:
+                self.cmb_m1_sup.setCurrentIndex(0)
+                self.ed_m1_rule_sup.clear()
+
+            self.lb_m1_net.setVisible(net_ok)
+            self.cmb_m1_net.setVisible(net_ok)
+            self.row_wj.setVisible(net_ok)
+            if not net_ok:
+                self.cmb_m1_net.setCurrentIndex(0)
+                for edit in (
+                        self.ed_m1_rule_wj_xx,
+                        self.ed_m1_rule_wj_fg,
+                        self.ed_m1_rule_wj_sx,
+                        self.ed_m1_rule_wj_gen,
+                ):
+                    edit.clear()
+
+            self.row_m1_strategy.setVisible(sup_ok or net_ok)
+
     def _apply_detection_to_mode2_ui(self):
         gz_ok = self.present.get("钢柱", False)
         gl_ok = self.present.get("钢梁", False)
@@ -491,6 +629,78 @@ class MainWindow(QMainWindow):
     def _go_back_to_select(self):
         self.stack.setCurrentIndex(0)
         self.status.setText("准备就绪")
+
+    # ====== Mode 1：日期分桶 ======
+    def _collect_mode1_buckets(self) -> list[dict]:
+        raw = (self.ed_m1_dates.text() or "").strip()
+        dates = [t for t in re.split(r"[,\s，、]+", raw) if t]
+
+        def to_rule(s: str):
+            s = (s or "").strip()
+            if not s or s.lower() == "lk":
+                return {"enabled": False, "ranges": []}
+            if s in ("*", "＊", "全部", "所有"):
+                return {"enabled": True, "ranges": []}
+            return {"enabled": True, "ranges": s}
+
+        rules_common: dict[str, object] = {}
+        if self.row_gz.isVisible():
+            rules_common["钢柱"] = to_rule(self.ed_m1_rule_gz.text())
+        if self.row_gl.isVisible():
+            rules_common["钢梁"] = to_rule(self.ed_m1_rule_gl.text())
+        if self.row_sup.isVisible():
+            rules_common["支撑"] = to_rule(self.ed_m1_rule_sup.text())
+        if self.row_wj.isVisible():
+            rules_common["网架"] = {
+                "strategy": "floor" if self.cmb_m1_net.currentIndex() == 1 else "number",
+                "parts": {
+                    "XX": to_rule(self.ed_m1_rule_wj_xx.text()),
+                    "FG": to_rule(self.ed_m1_rule_wj_fg.text()),
+                    "SX": to_rule(self.ed_m1_rule_wj_sx.text()),
+                    "GEN": to_rule(self.ed_m1_rule_wj_gen.text()),
+                },
+            }
+
+        buckets = [{"date_raw": d, "rules": copy.deepcopy(rules_common), "kws": []} for d in dates]
+        return buckets
+
+    def _on_run_mode1(self):
+        if not export_mode1_noninteractive:
+            QMessageBox.critical(self, "提示", "后端暂不支持 Mode 1 生成接口。")
+            return
+        if not self.doc_path:
+            QMessageBox.warning(self, "提示", "请先选择 Word 源文件。")
+            return
+
+        buckets = self._collect_mode1_buckets()
+        if not buckets:
+            QMessageBox.warning(self, "提示", "请至少输入一个日期。")
+            return
+
+        support_strategy = "floor" if self.cmb_m1_sup.isVisible() and self.cmb_m1_sup.currentIndex() == 1 else "number"
+        net_strategy = "floor" if self.cmb_m1_net.isVisible() and self.cmb_m1_net.currentIndex() == 1 else "number"
+        later_priority = self.ck_m1_later.isChecked()
+        auto_merge_rest = self.ck_m1_merge.isChecked()
+
+        self.status.setText("⏳ 正在生成（Mode 1 / 日期分桶）…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            xlsx, word = export_mode1_noninteractive(
+                src_docx=str(self.doc_path),
+                buckets=buckets,
+                support_strategy=support_strategy,
+                net_strategy=net_strategy,
+                later_priority=later_priority,
+                auto_merge_rest=auto_merge_rest,
+                meta={},
+            )
+            QMessageBox.information(self, "完成", f"✅ 生成完成！\nExcel：{xlsx}\n汇总Word：{word}")
+            self.status.setText("✅ 日期分桶完成")
+        except Exception as e:
+            QMessageBox.critical(self, "失败", f"生成失败：\n{e}")
+            self.status.setText("❌ 生成失败")
+        finally:
+            QApplication.restoreOverrideCursor()
 
     # ====== 生成：Mode 3 ======
     def _on_run_mode3(self):
