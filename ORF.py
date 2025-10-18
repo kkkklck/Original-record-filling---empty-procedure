@@ -5,7 +5,6 @@
 from pathlib import Path
 import re, copy, math, warnings, sys, os, unicodedata, ctypes
 from collections import defaultdict
-from datetime import datetime
 from typing import Union
 from docx import Document
 from docx.shared import RGBColor, Pt
@@ -1550,13 +1549,18 @@ def _parse_int_ranges(expr: str) -> List[Tuple[int, int]]:
     if text in ("*", "＊"):
         return []
 
+    # 先做 NFKC 规范化 + 统一连字符
+    text = unicodedata.normalize("NFKC", text)
+    # 把各种“看起来像连字符/波浪线/中文至到”统一成 '-'
+    text = re.sub(r"[－—–−~～〜至到]", "-", text)
+
     # ***** 特殊楼层映射 *****
     JF_VAL = 10**6 - 1    # 机房
     WM_VAL = 10**6        # 屋面/屋顶层/顶层
     SPECIAL_MAP = {
-        "机房": JF_VAL, "机房层": JF_VAL, "jf": JF_VAL, "ＪＦ": JF_VAL,
+        "机房": JF_VAL, "机房层": JF_VAL, "jf": JF_VAL,
         "屋面": WM_VAL, "屋顶层": WM_VAL, "顶层": WM_VAL,
-        "wm": WM_VAL, "ＷＭ": WM_VAL, "roof": WM_VAL,
+        "wm": WM_VAL, "roof": WM_VAL,
     }
 
     def norm_token(tok: str) -> str:
@@ -1569,10 +1573,11 @@ def _parse_int_ranges(expr: str) -> List[Tuple[int, int]]:
 
     # 各类正则
     re_int = re.compile(r"^\s*\d+\s*$")
-    re_num_num = re.compile(r"^\s*(\d+)\s*[-—–~至到]\s*(\d+)\s*$")
-    re_a_sp   = re.compile(r"^\s*(\d+)\s*[-—–~至到]\s*([^\d\s]+)\s*$")
-    re_sp_b   = re.compile(r"^\s*([^\d\s]+)\s*[-—–~至到]\s*(\d+)\s*$")
-    re_sp_sp  = re.compile(r"^\s*([^\d\s]+)\s*[-—–~至到]\s*([^\d\s]+)\s*$")
+    # 统一后只需要匹配 '-'
+    re_num_num = re.compile(r"^\s*(\d+)\s*-\s*(\d+)\s*$")
+    re_a_sp   = re.compile(r"^\s*(\d+)\s*-\s*([^\d\s]+)\s*$")
+    re_sp_b   = re.compile(r"^\s*([^\d\s]+)\s*-\s*(\d+)\s*$")
+    re_sp_sp  = re.compile(r"^\s*([^\d\s]+)\s*-\s*([^\d\s]+)\s*$")
 
     def sp_val(s: str):
         key = norm_token(s).replace("（", "(").replace("）", ")")
@@ -2080,13 +2085,13 @@ class Mode1ConfigProvider:
         else:
             enabled_flag = True
             ranges_raw = rule_data
-        enabled_flag = bool(enabled_flag)
-        if not enabled_flag:
-            return {"enabled": False, "ranges": []}
         ranges = self._coerce_ranges(ranges_raw)
         if ranges is None:
             return {"enabled": False, "ranges": []}
-        return {"enabled": True, "ranges": ranges}
+        ranges = self._coerce_ranges(ranges_raw)
+        if ranges == [(1, 0)]:
+            return {"enabled": False, "ranges": []}
+        return {"enabled": bool(enabled_flag), "ranges": ranges}
 
     def _coerce_ranges(self, ranges_raw):
         if isinstance(ranges_raw, list):
@@ -2095,7 +2100,8 @@ class Mode1ConfigProvider:
         if not s:
             return None
         if _is_lk(s):
-            return []
+            # 返回一个“空集哨兵”，上层据此把 enabled 置 False
+            return [(1, 0)]
         if s in ("*", "＊"):
             return []
         return _parse_int_ranges(s)
