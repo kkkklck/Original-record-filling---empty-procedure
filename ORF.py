@@ -2023,6 +2023,13 @@ def assign_by_buckets(cat_groups: dict, buckets, later_priority=True):
     return cat_byb, remain_by_cat
 
 
+def _to_bool(x):
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    return s in {"1", "true", "y", "yes", "on"}
+
+
 class Mode1ConfigProvider:
     """前端配置适配层，提供 Mode 1 所需的结构化配置。"""
 
@@ -2038,8 +2045,8 @@ class Mode1ConfigProvider:
         self.raw_buckets = list(buckets or [])
         self.support_strategy = (support_strategy or "number").lower()
         self.net_strategy = (net_strategy or "number").lower()
-        self.later_priority = bool(later_priority)
-        self.auto_merge_rest = bool(auto_merge_rest)
+        self.later_priority = _to_bool(later_priority)
+        self.auto_merge_rest = _to_bool(auto_merge_rest)
         self.meta = dict(meta or {})
         self._normalized_buckets = [self._normalize_bucket(b) for b in self.raw_buckets]
 
@@ -2485,6 +2492,9 @@ def cleanup_unused_sheets(wb, used_names, bases=("钢柱", "钢梁", "支撑", "
         used_names: 已使用的工作表名称列表
         bases: 目标类型基础名称列表
     """
+    # 如果没有任何工作表被使用，则不进行清理，避免误删模板页
+    if not used_names:
+        return
     used = set(used_names)
     to_remove = []
     for ws in list(wb.worksheets):
