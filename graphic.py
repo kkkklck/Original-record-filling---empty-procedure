@@ -10,7 +10,7 @@ from __future__ import annotations
 import os, sys, importlib.util, re, copy
 from pathlib import Path
 from dataclasses import dataclass
-
+import unicodedata
 from PySide6.QtCore import Qt, QSize, QThread, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
@@ -573,12 +573,16 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _to_rule(value: str) -> dict:
-        text = (value or "").strip()
-        if not text:
-            return {"enabled": False, "ranges": []}
-        if text in {"*", "＊", "全部", "所有"}:
-            return {"enabled": True, "ranges": []}
-        return {"enabled": True, "ranges": text}
+        raw_text = (value or "").strip()
+        normalized = unicodedata.normalize("NFKC", raw_text).strip()
+        if not normalized:
+            return {"enabled": False, "ranges": None}
+
+        normalized_cf = normalized.casefold()
+        if normalized in {"*", "全部", "所有"} or normalized_cf == "all":
+            return {"enabled": True, "ranges": [], "explicit_all": True}
+
+        return {"enabled": True, "ranges": normalized}
 
     def _apply_detection_to_mode2_ui(self):
         gz_ok = self.present.get("钢柱", False)
