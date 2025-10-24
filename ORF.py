@@ -1677,14 +1677,31 @@ def parse_rule(text: str):
             - ranges: 解析后的范围列表（list[tuple[int, int]]，空列表表示全部）
     """
     s = (text or "").strip()
-    if not s: return {"enabled": False, "ranges": []}
-    if s.lower() in ("*", "all") or s in ("全部", "所有"): return {"enabled": True, "ranges": []}
+    if not s:
+        return {"enabled": False, "ranges": []}
+    if _is_explicit_all_token(s):
+        return {"enabled": True, "ranges": [], "explicit_all": True}
     return {"enabled": True, "ranges": _parse_int_ranges(s)}
 
 
 def _is_lk(s: str) -> bool:
     """大小写及全角半角均识别 'lk'。"""
     return unicodedata.normalize('NFKC', (s or '')).strip().lower() == 'lk'
+
+
+_STAR_TOKENS = {"*", "全部", "所有"}
+
+
+def _is_explicit_all_token(value) -> bool:
+    """判定输入是否表示显式的“全部接收”。"""
+    if not isinstance(value, str):
+        return False
+    token = unicodedata.normalize("NFKC", value or "").strip()
+    if not token:
+        return False
+    if token in _STAR_TOKENS:
+        return True
+    return token.casefold() == "all"
 
 
 def _in_ranges(val: int, ranges):
@@ -2086,32 +2103,43 @@ class Mode1ConfigProvider:
     def _normalize_simple_rule(self, rule_data):
         if rule_data is None:
             return {"enabled": False, "ranges": []}
-        if isinstance(rule_data, dict):
-            enabled_flag = rule_data.get("enabled")
-            ranges_raw = rule_data.get("ranges")
-        else:
-            enabled_flag = True
-            ranges_raw = rule_data
-        ranges = self._coerce_ranges(ranges_raw)
-        if ranges is None:
-            return {"enabled": False, "ranges": []}
-        ranges = self._coerce_ranges(ranges_raw)
-        if ranges == [(1, 0)]:
-            return {"enabled": False, "ranges": []}
-        return {"enabled": bool(enabled_flag), "ranges": ranges}
+            explicit_all = False
+            if isinstance(rule_data, dict):
+                enabled_flag = rule_data.get("enabled")
+                if enabled_flag is None:
+                    enabled_flag = True
+                ranges_raw = rule_data.get("ranges")
+                explicit_all = bool(
+                    rule_data.get("explicit_all")
+                    or _is_explicit_all_token(rule_data.get("raw"))
+                    or _is_explicit_all_token(rule_data.get("text"))
+                    or _is_explicit_all_token(ranges_raw if isinstance(ranges_raw, str) else "")
+                )
+            else:
+                enabled_flag = True
+                ranges_raw = rule_data
+                explicit_all = _is_explicit_all_token(rule_data if isinstance(rule_data, str) else "")
+            ranges = self._coerce_ranges(ranges_raw)
+            if ranges is None:
+                return {"enabled": False, "ranges": []}
+            if ranges == [(1, 0)]:
+                return {"enabled": False, "ranges": []}
+            if ranges == [] and not explicit_all:
+                return {"enabled": False, "ranges": []}
+            return {"enabled": bool(enabled_flag), "ranges": ranges}
 
-    def _coerce_ranges(self, ranges_raw):
-        if isinstance(ranges_raw, list):
-            return list(ranges_raw)
-        s = str(ranges_raw or "").strip()
-        if not s:
-            return None
-        if _is_lk(s):
-            # 返回一个“空集哨兵”，上层据此把 enabled 置 False
-            return [(1, 0)]
-        if s in ("*", "＊"):
-            return []
-        return _parse_int_ranges(s)
+        def _coerce_ranges(self, ranges_raw):
+            if isinstance(ranges_raw, list):
+                return list(ranges_raw)
+            s = unicodedata.normalize("NFKC", str(ranges_raw or "")).strip()
+            if not s:
+                return None
+            if _is_lk(s):
+                # 返回一个“空集哨兵”，上层据此把 enabled 置 False
+                return [(1, 0)]
+            if _is_explicit_all_token(s):
+                return []
+            return _parse_int_ranges(s)
 
     def _normalize_net_rule(self, rule):
         data = dict(rule or {})
