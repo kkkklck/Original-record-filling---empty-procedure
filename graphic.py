@@ -687,7 +687,7 @@ class MainWindow(QMainWindow):
                     "GEN": self._to_rule(form["网架_gen"].text()),
                 }
 
-            buckets.append({"date": date_str, "parts": parts})
+            buckets.append({"date": date_str, "rules": parts})
 
         return buckets
 
@@ -707,7 +707,8 @@ class MainWindow(QMainWindow):
         def _has_content(bucket: dict) -> bool:
             if bucket.get("date"):
                 return True
-            for key, value in bucket.get("parts", {}).items():
+            rules = bucket.get("rules") or bucket.get("parts") or {}
+            for key, value in rules.items():
                 if key == "网架":
                     if any(part.get("enabled") for part in value.values()):
                         return True
