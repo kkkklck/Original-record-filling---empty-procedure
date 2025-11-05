@@ -2106,7 +2106,7 @@ class Mode1ConfigProvider:
             "rules": {},
             "kws": kws,
         }
-        rules_in = data.get("rules") or {}
+        rules_in = data.get("rules") or data.get("parts") or {}
         for cat, rule in rules_in.items():
             if cat == "网架":
                 normalized["rules"][cat] = self._normalize_net_rule(rule)
@@ -3685,10 +3685,7 @@ def export_mode1_noninteractive(
                 day_blocks += blocks_slices_by_cat[cat][day_idx]
         fill_blocks_to_pages(wb, day_pages, day_blocks, prog)
         raw = buckets_norm[day_idx].get("date_raw") or buckets_norm[day_idx].get("date") or ""
-        try:
-            dt = _normalize_date(raw) if raw else ""
-        except Exception:
-            dt = (buckets_norm[day_idx].get("date") or "").strip()
+        dt = normalize_date(raw) if raw else ""
         apply_meta_on_pages(wb, day_pages, dt)
 
     prog.finish()
