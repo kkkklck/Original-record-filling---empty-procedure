@@ -1190,25 +1190,54 @@ def apply_meta_fixed(wb, categories_present, meta: dict):
 
 def apply_meta_on_pages(wb, pages: list[str], date_str: str):
     """
-    向指定 Excel 工作表写入可选元信息的占位函数。
+    向指定 Excel 工作表写入日期元信息，支持公式检测和清除。
 
-    目前未对页内元信息进行写入，保留 ``date_str`` 参数仅为兼容旧流程，
-    便于后续需要时扩展。
+    写入逻辑：
+    1. 定位到第32行第1列（或其合并单元格的左上角）
+    2. 检测该单元格是否包含公式引用
+    3. 如果包含公式，先清除公式再写入值（避免多个sheet共享同一数据源）
+    4. 写入日期值并保留单元格对齐格式
+    5. 输出调试日志以便追踪写入过程
 
     Args:
         wb: Excel 工作簿对象（openpyxl.workbook.Workbook）
         pages: 工作表名称列表（list[str]）
-        date_str: 日期字符串（str），保留参数（当前未使用）
+        date_str: 日期字符串（str），如"2025年1月1日"
     """
     if not pages:
         return
     value = (date_str or "").strip()
+    # 调试日志：显示即将写入的日期和页面列表
+    if value:
+        print(f"\n📅 [apply_meta_on_pages] 写入日期: '{value}' 到 {len(pages)} 个sheet")
     for name in pages:
         if name not in wb.sheetnames:
             continue
         ws = wb[name]
         r0, c0 = top_left_of_merged(ws, 32, 1)
-        keep_align(ws.cell(row=r0, column=c0), value)
+        cell = ws.cell(row=r0, column=c0)
+
+        # 读取当前单元格的值和类型
+        old_value = cell.value
+        has_formula = False
+
+        # 检测是否包含公式（Excel公式以"="开头）
+        if old_value and isinstance(old_value, str) and old_value.startswith('='):
+            has_formula = True
+            print(f"⚠️  [{name}] 单元格({r0},{c0})包含公式: {old_value}")
+            # 先清空单元格，断开公式引用
+            cell.value = None
+
+        # 写入日期值（保留对齐格式）
+        keep_align(cell, value)
+
+        # 验证写入结果
+        actual_value = ws.cell(row=r0, column=c0).value
+        if has_formula:
+            print(f"✓  [{name}] 已清除公式并写入: '{actual_value}' 到 ({r0},{c0})")
+        elif value:
+            # 仅在有值时输出日志
+            print(f"   [{name}] 写入: '{actual_value}' 到 ({r0},{c0})")
 
 
 # ===== 规范化 =====
@@ -2103,43 +2132,43 @@ class Mode1ConfigProvider:
     def _normalize_simple_rule(self, rule_data):
         if rule_data is None:
             return {"enabled": False, "ranges": []}
-            explicit_all = False
-            if isinstance(rule_data, dict):
-                enabled_flag = rule_data.get("enabled")
-                if enabled_flag is None:
-                    enabled_flag = True
-                ranges_raw = rule_data.get("ranges")
-                explicit_all = bool(
-                    rule_data.get("explicit_all")
-                    or _is_explicit_all_token(rule_data.get("raw"))
-                    or _is_explicit_all_token(rule_data.get("text"))
-                    or _is_explicit_all_token(ranges_raw if isinstance(ranges_raw, str) else "")
-                )
-            else:
+        explicit_all = False
+        if isinstance(rule_data, dict):
+            enabled_flag = rule_data.get("enabled")
+            if enabled_flag is None:
                 enabled_flag = True
-                ranges_raw = rule_data
-                explicit_all = _is_explicit_all_token(rule_data if isinstance(rule_data, str) else "")
-            ranges = self._coerce_ranges(ranges_raw)
-            if ranges is None:
-                return {"enabled": False, "ranges": []}
-            if ranges == [(1, 0)]:
-                return {"enabled": False, "ranges": []}
-            if ranges == [] and not explicit_all:
-                return {"enabled": False, "ranges": []}
-            return {"enabled": bool(enabled_flag), "ranges": ranges}
+            ranges_raw = rule_data.get("ranges")
+            explicit_all = bool(
+                rule_data.get("explicit_all")
+                or _is_explicit_all_token(rule_data.get("raw"))
+                or _is_explicit_all_token(rule_data.get("text"))
+                or _is_explicit_all_token(ranges_raw if isinstance(ranges_raw, str) else "")
+                )
+        else:
+            enabled_flag = True
+            ranges_raw = rule_data
+            explicit_all = _is_explicit_all_token(rule_data if isinstance(rule_data, str) else "")
+        ranges = self._coerce_ranges(ranges_raw)
+        if ranges is None:
+            return {"enabled": False, "ranges": []}
+        if ranges == [(1, 0)]:
+            return {"enabled": False, "ranges": []}
+        if ranges == [] and not explicit_all:
+            return {"enabled": False, "ranges": []}
+        return {"enabled": bool(enabled_flag), "ranges": ranges}
 
-        def _coerce_ranges(self, ranges_raw):
-            if isinstance(ranges_raw, list):
-                return list(ranges_raw)
-            s = unicodedata.normalize("NFKC", str(ranges_raw or "")).strip()
-            if not s:
-                return None
-            if _is_lk(s):
-                # 返回一个“空集哨兵”，上层据此把 enabled 置 False
-                return [(1, 0)]
-            if _is_explicit_all_token(s):
-                return []
-            return _parse_int_ranges(s)
+    def _coerce_ranges(self, ranges_raw):
+        if isinstance(ranges_raw, list):
+            return list(ranges_raw)
+        s = unicodedata.normalize("NFKC", str(ranges_raw or "")).strip()
+        if not s:
+            return None
+        if _is_lk(s):
+            # 返回一个“空集哨兵”，上层据此把 enabled 置 False
+            return [(1, 0)]
+        if _is_explicit_all_token(s):
+            return []
+        return _parse_int_ranges(s)
 
     def _normalize_net_rule(self, rule):
         data = dict(rule or {})
