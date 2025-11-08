@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
     QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QRadioButton, QButtonGroup,
     QCheckBox, QMessageBox, QSpacerItem, QSizePolicy, QStackedWidget, QFrame,
-    QComboBox, QScrollArea, QSpinBox,
+    QComboBox, QScrollArea, QSpinBox, QPlainTextEdit
 )
 
 
@@ -56,6 +56,12 @@ run_noninteractive = _ORF.run_noninteractive
 Mode1ConfigProvider = getattr(_ORF, "Mode1ConfigProvider", None)
 run_mode1_with_provider = getattr(_ORF, "run_mode1_with_provider", None)
 export_mode1_noninteractive = getattr(_ORF, "export_mode1_noninteractive", None)
+export_mode4_noninteractive = getattr(_ORF, "export_mode4_noninteractive", None)
+prepare_from_word = getattr(_ORF, "prepare_from_word", None)
+_floor_label_from_name = getattr(_ORF, "_floor_label_from_name", None)
+_floor_sort_key_by_label = getattr(_ORF, "_floor_sort_key_by_label", None)
+_normalize_date_fn = getattr(_ORF, "normalize_date", None)
+_normalize_date_alt = getattr(_ORF, "_normalize_date", None)
 BACKEND_TITLE = getattr(_ORF, "TITLE", "原始记录自动填写程序")
 ORF_LOADED_FROM = getattr(_ORF, "__file__", None)
 # ===================================
@@ -152,6 +158,8 @@ class MainWindow(QMainWindow):
         self.present = {k: False for k in CANON_KEYS}
         self.counts  = {k: 0 for k in CANON_KEYS}
         self._m1_day_forms: list[dict] = []
+        self._floors_by_cat: dict[str, set[str]] = {}
+        self._grouped_cache = None
 
         self.stack = QStackedWidget()
         self.page_select = self._build_page_select()
@@ -212,7 +220,7 @@ class MainWindow(QMainWindow):
         self.rb_m3 = QRadioButton("Mode 3")
         self.rb_m4 = QRadioButton("Mode 4")
         self.rb_m2.setChecked(True)
-        self.rb_m4.setEnabled(False)
+        self.rb_m4.setEnabled(True)
         self.grp_mode = QButtonGroup(self)
         for i, rb in enumerate([self.rb_m1, self.rb_m2, self.rb_m3, self.rb_m4], start=1):
             self.grp_mode.addButton(rb, i); lm.addWidget(rb)
@@ -366,16 +374,97 @@ class MainWindow(QMainWindow):
         self._update_sup_bp_ui()
         self._update_net_bp_ui()
 
+        # (E) Mode 4 表单
+        self.box_m4 = QGroupBox("3C. Mode 4（多日按楼层计划）")
+        lm4 = QVBoxLayout(self.box_m4)
+        lm4.setSpacing(10)
+
+        self.lb_m4_hint = QLabel("语法：楼层: 日期/上限, 日期/上限 …（上限留空或“-”表示不限；* 表示默认楼层）")
+        self.lb_m4_hint.setStyleSheet("color:#555;")
+        lm4.addWidget(self.lb_m4_hint)
+
+        self.lb_m4_floors = QLabel("")
+        self.lb_m4_floors.setStyleSheet("color:#888; font-size:12px;")
+        lm4.addWidget(self.lb_m4_floors)
+
+        def _make_m4_group(title: str, placeholder: str = ""):
+            grp = QGroupBox(title)
+            lay_grp = QVBoxLayout(grp)
+            lay_grp.setContentsMargins(12, 12, 12, 12)
+            txt = QPlainTextEdit()
+            txt.setPlaceholderText(placeholder or "例：1F: 2025-1-01/30, 2025-1-03/40")
+            txt.setMinimumHeight(110)
+            lay_grp.addWidget(txt)
+            return grp, txt
+
+        placeholder = "例：1F: 2025-1-01/30, 2025-1-03/40\n2F: 2025-1-02/25\n*: 2025-1-10/50"
+        self.grp_m4_gz, self.txt_m4_gz = _make_m4_group("钢柱", placeholder)
+        self.grp_m4_gl, self.txt_m4_gl = _make_m4_group("钢梁", placeholder)
+        self.grp_m4_sup, self.txt_m4_sup = _make_m4_group("支撑", placeholder)
+        self.grp_m4_net, self.txt_m4_net = _make_m4_group("网架", placeholder)
+
+        for grp in (self.grp_m4_gz, self.grp_m4_gl, self.grp_m4_sup, self.grp_m4_net):
+            lm4.addWidget(grp)
+
+        row_m4_opts = QHBoxLayout()
+        self.lb_m4_sup_strategy = QLabel("支撑分段")
+        self.cmb_m4_sup_strategy = QComboBox(); self.cmb_m4_sup_strategy.addItems(["编号", "楼层"])
+        self.lb_m4_net_strategy = QLabel("网架分段")
+        self.cmb_m4_net_strategy = QComboBox(); self.cmb_m4_net_strategy.addItems(["编号", "楼层"])
+        self.ck_m4_support = QCheckBox("包含支撑")
+        self.ck_m4_support.setChecked(True)
+        for wdg in (
+            self.lb_m4_sup_strategy,
+            self.cmb_m4_sup_strategy,
+            self.lb_m4_net_strategy,
+            self.cmb_m4_net_strategy,
+            self.ck_m4_support,
+        ):
+            row_m4_opts.addWidget(wdg)
+        row_m4_opts.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        lm4.addLayout(row_m4_opts)
+
+        row_m4_fallback = QHBoxLayout()
+        row_m4_fallback.addWidget(QLabel("未分配处理"))
+        self.cmb_m4_fallback = QComboBox()
+        self.cmb_m4_fallback.addItems(["并入最后一天", "使用默认计划", "报错"])
+        row_m4_fallback.addWidget(self.cmb_m4_fallback)
+        row_m4_fallback.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        lm4.addLayout(row_m4_fallback)
+
+        self.w_m4_default = QWidget()
+        lay_def = QHBoxLayout(self.w_m4_default)
+        lay_def.setContentsMargins(0, 0, 0, 0)
+        lay_def.setSpacing(12)
+        self.ed_m4_def_dates = QLineEdit(); self.ed_m4_def_dates.setPlaceholderText("默认日期（空格/逗号分隔）")
+        self.ed_m4_def_limits = QLineEdit(); self.ed_m4_def_limits.setPlaceholderText("默认每日上限，如：40 或 40 35")
+        lay_def.addWidget(QLabel("默认日期"))
+        lay_def.addWidget(self.ed_m4_def_dates, 1)
+        lay_def.addWidget(QLabel("默认上限"))
+        lay_def.addWidget(self.ed_m4_def_limits, 1)
+        lm4.addWidget(self.w_m4_default)
+        self.w_m4_default.setVisible(False)
+
+        row_go_m4 = QHBoxLayout()
+        row_go_m4.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        self.btn_run_m4 = QPushButton("生成（Mode 4）")
+        self.btn_run_m4.setFixedSize(QSize(180, 36))
+        row_go_m4.addWidget(self.btn_run_m4)
+        lm4.addLayout(row_go_m4)
+
         # 容器：只显示当前模式对应的表单
         self.panel_wrap = QVBoxLayout()
         self.panel_wrap.addWidget(self.box_m1)
         self.panel_wrap.addWidget(self.box_m2)  # 默认显示 M2
         self.panel_wrap.addWidget(self.box_m3)
+        self.panel_wrap.addWidget(self.box_m4)
         self.box_m1.setVisible(False)
         self.box_m3.setVisible(False)
+        self.box_m4.setVisible(False)
 
         lay.addLayout(self.panel_wrap)
         lay.addStretch(1)
+
 
 
         lay.addWidget(hline())
@@ -389,8 +478,13 @@ class MainWindow(QMainWindow):
         self.btn_run_m1.clicked.connect(self._on_run_mode1)
         self.btn_run_m2.clicked.connect(self._on_run_mode2)
         self.btn_run_m3.clicked.connect(self._on_run_mode3)
+        self.btn_run_m4.clicked.connect(self._on_run_mode4)
+        self.cmb_m4_fallback.currentIndexChanged.connect(self._on_m4_fallback_changed)
+        self.ck_m4_support.toggled.connect(self._on_m4_support_toggled)
 
         self._apply_detection_to_mode1_ui()
+        self._on_m4_support_toggled(self.ck_m4_support.isChecked())
+        self._on_m4_fallback_changed(self.cmb_m4_fallback.currentIndex())
 
         return w
 
@@ -445,6 +539,8 @@ class MainWindow(QMainWindow):
             return
 
         self.doc_path = fp
+        self._grouped_cache = None
+        self._floors_by_cat = {}
         self.lb_status1.setText("🔎 正在分析文档…")
         self.btn_browse.setEnabled(False)
 
@@ -464,6 +560,9 @@ class MainWindow(QMainWindow):
         # 切到 Step 2，并按检索结果刷新 UI
         self._apply_detection_to_mode1_ui()
         self._apply_detection_to_mode2_ui()
+        self._ensure_floor_info()
+        self._apply_detection_to_mode4_ui()
+        self._update_m4_floor_hint()
         self._refresh_found_bar()
         self.lb_file_short.setText(f"文件：{self.doc_path.name}")
         self.status.setText("✅ 已分析完成，可选择模式继续")
@@ -477,6 +576,8 @@ class MainWindow(QMainWindow):
         self.box_m1.setVisible(current is self.rb_m1)
         self.box_m2.setVisible(current is self.rb_m2)
         self.box_m3.setVisible(current is self.rb_m3)
+        self.box_m4.setVisible(current is self.rb_m4)
+
 
     # 顶部“识别结果”标签条
     def _refresh_found_bar(self):
@@ -635,8 +736,8 @@ class MainWindow(QMainWindow):
             self.cmb_net_strategy.setCurrentIndex(0)
             self.ed_bp_net.clear()
 
-        self._update_sup_bp_ui()
-        self._update_net_bp_ui()
+            self._update_sup_bp_ui()
+            self._update_net_bp_ui()
 
     def _update_sup_bp_ui(self):
         if not hasattr(self, "cmb_sup_strategy"):
@@ -657,6 +758,94 @@ class MainWindow(QMainWindow):
         else:
             self.lb_net_bp.setText("网架断点（编号）")
             self.ed_bp_net.setPlaceholderText("例：10 20 30（空=不分段）")
+
+    def _ensure_floor_info(self):
+        if not hasattr(self, "lb_m4_floors"):
+            return
+        if self.doc_path is None or prepare_from_word is None:
+            self._floors_by_cat = {}
+            return
+        if self._grouped_cache is not None and self._floors_by_cat:
+            return
+        try:
+            grouped, _cats = prepare_from_word(self.doc_path)
+        except Exception:
+            self._grouped_cache = None
+            self._floors_by_cat = {}
+            return
+        self._grouped_cache = grouped
+        floors: dict[str, set[str]] = {}
+        for cat, groups in (grouped or {}).items():
+            labels = set()
+            for g in groups:
+                name = ""
+                try:
+                    name = g.get("name", "")  # type: ignore[call-arg]
+                except Exception:
+                    name = ""
+                label = None
+                if _floor_label_from_name:
+                    try:
+                        label = _floor_label_from_name(name)
+                    except Exception:
+                        label = None
+                if label and label != "F?":
+                    labels.add(label)
+            if labels:
+                floors[cat] = labels
+        self._floors_by_cat = floors
+
+    def _apply_detection_to_mode4_ui(self):
+        if not hasattr(self, "grp_m4_gz"):
+            return
+        gz_ok = self.present.get("钢柱", False)
+        gl_ok = self.present.get("钢梁", False)
+        sup_ok = self.present.get("支撑", False)
+        net_ok = self.present.get("网架", False)
+
+        self.grp_m4_gz.setVisible(gz_ok)
+        self.grp_m4_gl.setVisible(gl_ok)
+        self.grp_m4_net.setVisible(net_ok)
+        self.ck_m4_support.setVisible(sup_ok)
+        self.lb_m4_sup_strategy.setVisible(sup_ok)
+        self.cmb_m4_sup_strategy.setVisible(sup_ok)
+        if not sup_ok:
+            self.ck_m4_support.setChecked(False)
+        elif not self.ck_m4_support.isChecked():
+            self.ck_m4_support.setChecked(True)
+        self.lb_m4_net_strategy.setVisible(net_ok)
+        self.cmb_m4_net_strategy.setVisible(net_ok)
+        self.grp_m4_sup.setVisible(sup_ok and self.ck_m4_support.isChecked())
+
+        active_cats = [k for k in ("钢柱", "钢梁", "支撑", "网架") if self.present.get(k, False)]
+        self.box_m4.setDisabled(not active_cats)
+
+    def _update_m4_floor_hint(self):
+        if not hasattr(self, "lb_m4_floors"):
+            return
+        if not self._floors_by_cat:
+            self.lb_m4_floors.setText("（楼层信息将在读取后显示）")
+            return
+        parts = []
+        sorter = _floor_sort_key_by_label or (lambda x: x)
+        for cat in ("钢柱", "钢梁", "支撑", "网架"):
+            floors = sorted(self._floors_by_cat.get(cat, []), key=sorter)
+            if floors:
+                parts.append(f"{cat}：{' '.join(floors)}")
+        self.lb_m4_floors.setText(" | ".join(parts))
+
+    def _on_m4_support_toggled(self, checked: bool):
+        if not hasattr(self, "grp_m4_sup"):
+            return
+        sup_ok = self.present.get("支撑", False)
+        self.grp_m4_sup.setVisible(checked and sup_ok)
+        self.lb_m4_sup_strategy.setEnabled(checked)
+        self.cmb_m4_sup_strategy.setEnabled(checked)
+
+    def _on_m4_fallback_changed(self, idx: int):
+        if not hasattr(self, "w_m4_default"):
+            return
+        self.w_m4_default.setVisible(idx == 1)
 
     # ====== 返回 Step1 重选文件 ======
     def _go_back_to_select(self):
@@ -739,6 +928,175 @@ class MainWindow(QMainWindow):
             )
             QMessageBox.information(self, "完成", f"✅ 生成完成！\nExcel：{xlsx}\n汇总Word：{word}")
             self.status.setText("✅ 日期分桶完成")
+        except Exception as e:
+            QMessageBox.critical(self, "失败", f"生成失败：\n{e}")
+            self.status.setText("❌ 生成失败")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+            # ====== Mode 4：多日按楼层计划 ======
+
+    @staticmethod
+    def _parse_m4_lines(text: str) -> dict[str, list[tuple[str, int | None]]]:
+        res: dict[str, list[tuple[str, int | None]]] = {}
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" in line:
+                key, rhs = line.split(":", 1)
+            else:
+                key, rhs = "*", line
+            key = key.strip() or "*"
+            tokens = []
+            for seg in re.split(r"[，,]+", rhs):
+                seg = seg.strip()
+                if not seg:
+                    continue
+                parts = [p for p in re.split(r"\s+", seg) if p]
+                i = 0
+                while i < len(parts):
+                    cur = parts[i]
+                    if "/" in cur or i == len(parts) - 1:
+                        tokens.append(cur)
+                        i += 1
+                    else:
+                        tokens.append(f"{cur} {parts[i + 1]}")
+                        i += 2
+            entries: list[tuple[str, int | None]] = []
+            for tok in tokens:
+                if "/" in tok:
+                    d, l = tok.split("/", 1)
+                else:
+                    segs = tok.split()
+                    if len(segs) >= 2:
+                        d, l = segs[0], segs[1]
+                    else:
+                        d, l = segs[0], ""
+                d = d.strip()
+                l = l.strip()
+                if l in ("", "-", "∞"):
+                    limit = None
+                else:
+                    nums = re.findall(r"\d+", l)
+                    limit = int(nums[0]) if nums else None
+                if d:
+                    entries.append((d, limit))
+            if entries:
+                res[key] = entries
+        return res
+
+    def _collect_m4_plan(self) -> dict:
+        plan: dict[str, dict] = {}
+        if hasattr(self, "txt_m4_gz") and self.grp_m4_gz.isVisible():
+            data = self._parse_m4_lines(self.txt_m4_gz.toPlainText())
+            if data:
+                plan["钢柱"] = data
+        if hasattr(self, "txt_m4_gl") and self.grp_m4_gl.isVisible():
+            data = self._parse_m4_lines(self.txt_m4_gl.toPlainText())
+            if data:
+                plan["钢梁"] = data
+        if (
+                hasattr(self, "txt_m4_sup")
+                and self.grp_m4_sup.isVisible()
+                and self.ck_m4_support.isVisible()
+                and self.ck_m4_support.isChecked()
+        ):
+            data = self._parse_m4_lines(self.txt_m4_sup.toPlainText())
+            if data:
+                plan["支撑"] = data
+        if hasattr(self, "txt_m4_net") and self.grp_m4_net.isVisible():
+            data = self._parse_m4_lines(self.txt_m4_net.toPlainText())
+            if data:
+                plan["网架"] = data
+        return plan
+
+    def _parse_default_dates(self, raw: str) -> list[str]:
+        tokens = [t.strip() for t in re.split(r"[\s,，]+", raw or "") if t.strip()]
+        dates: list[str] = []
+        for tok in tokens:
+            parsed = None
+            for fn in (_normalize_date_fn, _normalize_date_alt):
+                if not fn:
+                    continue
+                try:
+                    parsed = fn(tok)
+                    break
+                except Exception:
+                    continue
+            if not parsed:
+                raise ValueError(f"无法识别的日期：{tok}")
+            dates.append(parsed)
+        return dates
+
+    def _on_run_mode4(self):
+        if not export_mode4_noninteractive:
+            QMessageBox.critical(self, "提示", "后端暂不支持 Mode 4 生成接口。")
+            return
+        if not self.doc_path:
+            QMessageBox.warning(self, "提示", "请先选择 Word 源文件。")
+            return
+
+        plan = self._collect_m4_plan()
+        if not plan:
+            QMessageBox.warning(self, "提示", "请至少为一个类别填写计划。")
+            return
+
+        sup_strategy = "number"
+        if self.lb_m4_sup_strategy.isVisible() and self.cmb_m4_sup_strategy.currentIndex() == 1:
+            sup_strategy = "floor"
+        net_strategy = "number"
+        if self.lb_m4_net_strategy.isVisible() and self.cmb_m4_net_strategy.currentIndex() == 1:
+            net_strategy = "floor"
+
+        fb_map = {0: "append_last", 1: "default", 2: "error"}
+        fallback = fb_map.get(self.cmb_m4_fallback.currentIndex(), "append_last")
+
+        default_entries = None
+        if fallback == "default":
+            try:
+                dates = self._parse_default_dates(self.ed_m4_def_dates.text())
+            except ValueError as exc:
+                QMessageBox.warning(self, "提示", str(exc))
+                return
+            if not dates:
+                QMessageBox.warning(self, "提示", "请填写默认日期。")
+                return
+            limits_text = (self.ed_m4_def_limits.text() or "").strip()
+            if not limits_text:
+                limits = [None] * len(dates)
+            else:
+                nums = [int(x) for x in re.findall(r"\d+", limits_text)]
+                if not nums:
+                    limits = [None] * len(dates)
+                elif len(nums) == 1:
+                    limits = [nums[0]] * len(dates)
+                elif len(nums) == len(dates):
+                    limits = nums
+                else:
+                    QMessageBox.warning(self, "提示", "默认上限数量需与日期数量一致，或仅填一个数。")
+                    return
+            default_entries = list(zip(dates, limits))
+
+        include_support = (
+                self.ck_m4_support.isVisible() and self.ck_m4_support.isEnabled() and self.ck_m4_support.isChecked()
+        )
+
+        self.status.setText("⏳ 正在生成（Mode 4）…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            xlsx, word = export_mode4_noninteractive(
+                src_docx=str(self.doc_path),
+                meta={},
+                plan=plan,
+                include_support=include_support,
+                support_strategy=sup_strategy,
+                net_strategy=net_strategy,
+                fallback=fallback,
+                default_entries=default_entries,
+            )
+            QMessageBox.information(self, "完成", f"✅ 生成完成！\nExcel：{xlsx}\n汇总Word：{word}")
+            self.status.setText("✅ Mode 4 完成")
         except Exception as e:
             QMessageBox.critical(self, "失败", f"生成失败：\n{e}")
             self.status.setText("❌ 生成失败")
