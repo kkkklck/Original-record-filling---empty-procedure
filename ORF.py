@@ -2725,6 +2725,12 @@ def prompt_mode4_plan(floors_by_cat, categories_present):
 
 def mode4_run(wb, grouped, categories_present):
     """执行模式4：按楼层和日期写入Excel。"""
+    injected_support = (globals().get("NONINTERACTIVE_MODE4_SUPPORT_STRATEGY") or "").lower()
+    if injected_support in {"number", "floor"}:
+        set_support_strategy(injected_support)
+    injected_net = (globals().get("NONINTERACTIVE_MODE4_NET_STRATEGY") or "").lower()
+    if injected_net in {"number", "floor"}:
+        set_net_strategy(injected_net)
     cf_groups = defaultdict(list)
     floors_by_cat = defaultdict(set)
     for cat in categories_present:
@@ -2732,7 +2738,9 @@ def mode4_run(wb, grouped, categories_present):
             fl = _floor_label_from_name(g["name"])
             cf_groups[(cat, fl)].append(g)
             floors_by_cat[cat].add(fl)
-    plan_dict = prompt_mode4_plan(floors_by_cat, categories_present)
+    plan_dict = globals().get("NONINTERACTIVE_MODE4_PLAN")
+    if not plan_dict:
+        plan_dict = prompt_mode4_plan(floors_by_cat, categories_present)
 
     blocks_by_cat_bucket = {cat: defaultdict(list) for cat in CATEGORY_ORDER}
     buckets = []  # list[{date}]
@@ -2758,47 +2766,82 @@ def mode4_run(wb, grouped, categories_present):
     # —— 兜底 ——
     left_total = sum(len(v) for v in leftover_by_cat.values())
     if left_total:
-        print(f"⚠️ 还有 {left_total} 组未分配。")
-        ans = ask("是否给未指定楼层套用【默认日期/数量】？(y=是 / 回车=否→回落到日期分桶)", lower=True)
-        if ans == "y":
-            default_entries = _prompt_dates_and_limits()
-            for cat in CATEGORY_ORDER:
-                if not leftover_by_cat.get(cat):
-                    continue
-                for date, slice_items in _distribute_by_dates(leftover_by_cat[cat], default_entries):
-                    if not slice_items:
+        injected_fallback = (globals().get("NONINTERACTIVE_MODE4_FALLBACK") or "").lower()
+        default_entries = globals().get("NONINTERACTIVE_MODE4_DEFAULT") or []
+        handled_noninteractive = False
+        if injected_fallback:
+            if injected_fallback == "default":
+                if not default_entries:
+                    raise RuntimeError("Mode4 fallback=default 但未提供 default_entries")
+                for cat in CATEGORY_ORDER:
+                    if not leftover_by_cat.get(cat):
                         continue
-                    if date not in date_idx:
-                        date_idx[date] = len(buckets)
-                        buckets.append({"date": date})
-                    idx = date_idx[date]
-                    blocks_by_cat_bucket[cat][idx].extend(expand_blocks(slice_items, PER_LINE_PER_BLOCK))
-                leftover_by_cat[cat] = []
-        else:
-            grouped_left = {c: leftover_by_cat[c] for c in CATEGORY_ORDER if leftover_by_cat.get(c)}
-            if grouped_left:
-                buckets2 = prompt_date_buckets(list(grouped_left.keys()), grouped_left)
-                later_first = prompt_bucket_priority()
-                cat_byb, remain_by_cat = assign_by_buckets(grouped_left, buckets2, later_first)
-                ok, auto_last = preview_buckets_generic(cat_byb, remain_by_cat, buckets2, list(grouped_left.keys()))
-                if ok:
-                    if auto_last:
-                        last = len(buckets2) - 1
-                        for c in grouped_left.keys():
-                            cat_byb[c][last].extend(remain_by_cat[c])
-                            remain_by_cat[c] = []
-                    blocks_by_cat_bucket2 = expand_blocks_by_bucket(cat_byb)
-                    for i, bk in enumerate(buckets2):
-                        date = bk["date"]
+                    for date, slice_items in _distribute_by_dates(leftover_by_cat[cat], default_entries):
+                        if not slice_items:
+                            continue
                         if date not in date_idx:
                             date_idx[date] = len(buckets)
                             buckets.append({"date": date})
                         idx = date_idx[date]
-                        for c in grouped_left.keys():
-                            blocks_by_cat_bucket[c][idx].extend(blocks_by_cat_bucket2[c].get(i, []))
-                    leftover_by_cat = remain_by_cat
-                else:
-                    print("❌ 已取消兜底分配。")
+                        blocks_by_cat_bucket[cat][idx].extend(expand_blocks(slice_items, PER_LINE_PER_BLOCK))
+                    leftover_by_cat[cat] = []
+                leftover_by_cat = defaultdict(list)
+                handled_noninteractive = True
+            elif injected_fallback == "append_last":
+                if not buckets:
+                    raise RuntimeError("Mode4 append_last 需要至少一个日期桶")
+                last_idx = len(buckets) - 1
+                for cat in CATEGORY_ORDER:
+                    if not leftover_by_cat.get(cat):
+                        continue
+                    blocks = expand_blocks(leftover_by_cat[cat], PER_LINE_PER_BLOCK)
+                    blocks_by_cat_bucket[cat][last_idx].extend(blocks)
+                leftover_by_cat = defaultdict(list)
+                handled_noninteractive = True
+            elif injected_fallback == "error":
+                raise RuntimeError("Mode4 未分配楼层未指定处理方案（fallback=error）")
+        if not handled_noninteractive:
+            print(f"⚠️ 还有 {left_total} 组未分配。")
+            ans = ask("是否给未指定楼层套用【默认日期/数量】？(y=是 / 回车=否→回落到日期分桶)", lower=True)
+            if ans == "y":
+                default_entries = _prompt_dates_and_limits()
+                for cat in CATEGORY_ORDER:
+                    if not leftover_by_cat.get(cat):
+                        continue
+                    for date, slice_items in _distribute_by_dates(leftover_by_cat[cat], default_entries):
+                        if not slice_items:
+                            continue
+                        if date not in date_idx:
+                            date_idx[date] = len(buckets)
+                            buckets.append({"date": date})
+                        idx = date_idx[date]
+                        blocks_by_cat_bucket[cat][idx].extend(expand_blocks(slice_items, PER_LINE_PER_BLOCK))
+                    leftover_by_cat[cat] = []
+            else:
+                grouped_left = {c: leftover_by_cat[c] for c in CATEGORY_ORDER if leftover_by_cat.get(c)}
+                if grouped_left:
+                    buckets2 = prompt_date_buckets(list(grouped_left.keys()), grouped_left)
+                    later_first = prompt_bucket_priority()
+                    cat_byb, remain_by_cat = assign_by_buckets(grouped_left, buckets2, later_first)
+                    ok, auto_last = preview_buckets_generic(cat_byb, remain_by_cat, buckets2, list(grouped_left.keys()))
+                    if ok:
+                        if auto_last:
+                            last = len(buckets2) - 1
+                            for c in grouped_left.keys():
+                                cat_byb[c][last].extend(remain_by_cat[c])
+                                remain_by_cat[c] = []
+                        blocks_by_cat_bucket2 = expand_blocks_by_bucket(cat_byb)
+                        for i, bk in enumerate(buckets2):
+                            date = bk["date"]
+                            if date not in date_idx:
+                                date_idx[date] = len(buckets)
+                                buckets.append({"date": date})
+                            idx = date_idx[date]
+                            for c in grouped_left.keys():
+                                blocks_by_cat_bucket[c][idx].extend(blocks_by_cat_bucket2[c].get(i, []))
+                        leftover_by_cat = remain_by_cat
+                    else:
+                        print("❌ 已取消兜底分配。")
 
     unassigned = sum(len(v) for v in leftover_by_cat.values())
 
@@ -3580,6 +3623,150 @@ def run_noninteractive(
     # 9) 返回路径
     word_out = src.with_name("汇总原始记录.docx")
     return {"excel": final_xlsx, "word": word_out}
+
+
+def _norm_entry_list(entries):
+    """规范化计划条目列表（日期统一为 YYYY-MM-DD，数量转 int/None）。"""
+    out = []
+    if not entries:
+        return out
+    for d, lim in entries:
+        nd = None
+        last_err = None
+        for fn in (normalize_date, _normalize_date):
+            if not fn:
+                continue
+            try:
+                nd = fn(d)
+                break
+            except Exception as exc:  # noqa: PERF203 - 需要逐个尝试
+                last_err = exc
+        if not nd:
+            raise ValueError(f"无法识别的日期：{d}") from last_err
+        if lim in (None, "", "-", "∞"):
+            nl = None
+        else:
+            try:
+                nl = int(lim)
+            except Exception:
+                digits = re.findall(r"\d+", str(lim))
+                nl = int(digits[0]) if digits else None
+        out.append((nd, nl))
+    return out
+
+
+def _norm_plan(plan: dict | None) -> dict:
+    """规范化按类别/楼层的计划结构。"""
+    if not plan:
+        return {}
+    result: dict = {}
+    for cat, by_floor in plan.items():
+        result[cat] = {}
+        for floor, entries in (by_floor or {}).items():
+            result[cat][floor] = _norm_entry_list(entries)
+    return result
+
+
+def export_mode4_noninteractive(
+        src_docx: Union[str, Path],
+        meta: dict | None = None,
+        wb=None,
+        *,
+        plan: dict | None = None,
+        include_support: bool = True,
+        support_strategy: str = "number",
+        net_strategy: str = "number",
+        fallback: str = "append_last",
+        default_entries: list[tuple[str, int | None]] | None = None,
+) -> tuple[Path, Path | None]:
+    """无交互导出 Mode4。"""
+
+    src = Path(str(src_docx)).resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"未找到 Word 源文件：{src}")
+
+    grouped = None
+    categories_present = None
+    cache_src = _PROBE_CACHE.get("src")
+    if cache_src and Path(str(cache_src)).resolve() == src:
+        grouped = _PROBE_CACHE.get("grouped") or defaultdict(list)
+        categories_present = list(_PROBE_CACHE.get("categories") or [])
+
+    if grouped is None or categories_present is None:
+        grouped, categories_present = prepare_from_word(src)
+    else:
+        if not isinstance(grouped, defaultdict):
+            tmp = defaultdict(list)
+            for k, v in (grouped or {}).items():
+                tmp[k] = list(v)
+            grouped = tmp
+
+    categories_present = [cat for cat in CATEGORY_ORDER if grouped.get(cat)]
+    if not include_support and "支撑" in categories_present:
+        categories_present = [c for c in categories_present if c != "支撑"]
+
+    prev_support = support_bucket_strategy
+    prev_net = net_bucket_strategy
+    sup_val = (support_strategy or "number").lower()
+    net_val = (net_strategy or "number").lower()
+    set_support_strategy(sup_val)
+    set_net_strategy(net_val)
+
+    if wb is None:
+        if not XLSX_WITH_SUPPORT_DEFAULT.exists():
+            raise FileNotFoundError(f"Excel 模板不存在：{XLSX_WITH_SUPPORT_DEFAULT}")
+        wb = load_workbook_safe(XLSX_WITH_SUPPORT_DEFAULT)
+
+    globals()["NONINTERACTIVE_MODE4_PLAN"] = _norm_plan(plan)
+    globals()["NONINTERACTIVE_MODE4_FALLBACK"] = (fallback or "").lower()
+    globals()["NONINTERACTIVE_MODE4_DEFAULT"] = _norm_entry_list(default_entries or [])
+    globals()["NONINTERACTIVE_MODE4_SUPPORT_STRATEGY"] = sup_val
+    globals()["NONINTERACTIVE_MODE4_NET_STRATEGY"] = net_val
+
+    try:
+        used_pages = run_mode("4", wb, grouped, categories_present)
+        apply_meta_fixed(wb, categories_present, meta or {})
+        cleanup_unused_mu_templates(wb, used_pages)
+
+        def _unique_out_path(dest_dir: Path, stem: str) -> Path:
+            cand = dest_dir / f"{stem}.xlsx"
+            if not cand.exists():
+                return cand
+            i = 1
+            while True:
+                cand = dest_dir / f"{stem}({i}).xlsx"
+                if not cand.exists():
+                    return cand
+                i += 1
+
+        final_xlsx = _unique_out_path(src.parent, f"{TITLE}_报告版")
+        save_workbook_safe(wb, final_xlsx)
+
+        word_out = src.with_name("汇总原始记录.docx")
+        if not word_out.exists():
+            all_rows = _PROBE_CACHE.get("all_rows")
+            if all_rows:
+                try:
+                    doc_out = build_summary_doc_with_progress(all_rows)
+                    set_doc_font_progress(doc_out, DEFAULT_FONT_PT)
+                    save_docx_safe(doc_out, word_out)
+                except Exception:
+                    word_out = None
+            else:
+                word_out = None
+
+        return final_xlsx, word_out
+    finally:
+        set_support_strategy(prev_support)
+        set_net_strategy(prev_net)
+        for key in (
+                "NONINTERACTIVE_MODE4_PLAN",
+                "NONINTERACTIVE_MODE4_FALLBACK",
+                "NONINTERACTIVE_MODE4_DEFAULT",
+                "NONINTERACTIVE_MODE4_SUPPORT_STRATEGY",
+                "NONINTERACTIVE_MODE4_NET_STRATEGY",
+        ):
+            globals().pop(key, None)
 
 
 def export_mode1_noninteractive(
