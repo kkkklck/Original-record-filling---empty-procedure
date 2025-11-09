@@ -12,6 +12,7 @@ from pathlib import Path
 from dataclasses import dataclass
 import unicodedata
 from PySide6.QtCore import Qt, QSize, QThread, Signal
+from PySide6.QtGui import QIcon, QPixmap, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
     QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QRadioButton, QButtonGroup,
@@ -154,6 +155,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{BACKEND_TITLE} · 图形界面")
         self.resize(1100, 700)
 
+        self.accent = "#2d89ef"  # 默认蓝
+        self._theme_options = [
+            ("蓝色", "#2d89ef"),
+            ("绿色", "#34c759"),
+            ("黄色", "#f7b500"),
+            ("粉色", "#ff2d55"),
+            ("橙色", "#ff9500"),
+            ("紫色", "#7e57c2"),
+        ]
+
         self.doc_path: Path | None = None
         self.present = {k: False for k in CANON_KEYS}
         self.counts  = {k: 0 for k in CANON_KEYS}
@@ -183,6 +194,21 @@ class MainWindow(QMainWindow):
         row.addWidget(self.ed_path, 1); row.addWidget(self.btn_browse, 0)
         b.addLayout(row)
 
+        # 颜色选择行
+        row_theme = QHBoxLayout()
+        row_theme.addWidget(QLabel("界面颜色"))
+        self.cmb_theme = QComboBox()
+
+        for name, hx in self._theme_options:
+            pm = QPixmap(14, 14)
+            pm.fill(QColor(hx))
+            self.cmb_theme.addItem(QIcon(pm), name, hx)
+
+        self.cmb_theme.setCurrentIndex(0)  # 默认蓝
+        row_theme.addWidget(self.cmb_theme)
+        row_theme.addStretch(1)
+        b.addLayout(row_theme)
+
         self.lb_status1 = QLabel("就绪"); self.lb_status1.setStyleSheet("color:#777;")
         b.addWidget(self.lb_status1)
         lay.addWidget(box)
@@ -191,6 +217,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(tip); lay.addStretch(1)
 
         self.btn_browse.clicked.connect(self._on_browse_and_probe)
+        self.cmb_theme.currentIndexChanged.connect(self._on_theme_changed)
         return w
 
     # ====== Page 2：模式选择 + 表单 ======
@@ -488,42 +515,51 @@ class MainWindow(QMainWindow):
 
         return w
 
-    # ====== 样式（增加 QCheckBox 的蓝色勾） ======
+        # ====== 样式（增加 QCheckBox 的蓝色勾） ======
+    def _on_theme_changed(self, idx: int):
+        hx = self.cmb_theme.itemData(idx)
+        if isinstance(hx, str) and hx.startswith("#"):
+            self.accent = hx
+            self._apply_styles()  # 重新套样式
+
     def _apply_styles(self):
-        self.setStyleSheet("""
-            QWidget { background:#ffffff; color:#333; font-size:14px; }
-            QGroupBox {
-                border:1px solid #e7e7e7; border-radius:12px; margin-top:12px; padding:12px;
-                font-weight:600;
-            }
-            QGroupBox::title { subcontrol-origin: margin; left:12px; padding:0 6px; background:transparent; }
-            QLineEdit {
-                height:34px; border:1px solid #d9d9d9; border-radius:8px; padding:4px 10px; background:#fafafa;
-            }
-            QPushButton {
-                height:34px; border:1px solid #d9d9d9; border-radius:10px; background:#f6f6f6; padding:0 12px;
-            }
-            QPushButton:hover { background:#efefef; }
-            /* —— 小蓝点单选 —— */
-            QRadioButton { spacing:8px; }
-            QRadioButton::indicator {
-                width:14px; height:14px; border-radius:7px;
-                border:2px solid #9aa0a6; background:#fff; margin-right:6px;
-            }
-            QRadioButton::indicator:hover { border-color:#6f8ccf; }
-            QRadioButton::indicator:checked {
-                background:#2d89ef; border:2px solid #2d89ef;
-            }
-            QRadioButton:checked { color:#2d89ef; font-weight:700; }
-            /* —— 复选框明显可见 —— */
-            QCheckBox::indicator {
-                width:16px; height:16px; border-radius:4px;
-                border:2px solid #9aa0a6; background:#fff; margin-right:6px;
-            }
-            QCheckBox::indicator:hover { border-color:#6f8ccf; }
-            QCheckBox::indicator:checked {
-                image: none; background:#2d89ef; border:2px solid #2d89ef;
-            }
+        c = self.accent
+        self.setStyleSheet(f"""
+    QWidget {{ background:#ffffff; color:#333; font-size:14px; }}
+                QGroupBox {{
+                    border:1px solid #e7e7e7; border-radius:12px; margin-top:12px; padding:12px;
+                    font-weight:600;
+                }}
+                QGroupBox::title {{ subcontrol-origin: margin; left:12px; padding:0 6px; background:transparent; }}
+                QLineEdit {{
+                    height:34px; border:1px solid #d9d9d9; border-radius:8px; padding:4px 10px; background:#fafafa;
+                }}
+                QPushButton {{
+                    height:34px; border:1px solid #d9d9d9; border-radius:10px; background:#f6f6f6; padding:0 12px;
+                }}
+                QPushButton:hover {{ background:#efefef; }}
+
+                /* —— 单选圆点 —— */
+                QRadioButton {{ spacing:8px; }}
+                QRadioButton::indicator {{
+                    width:14px; height:14px; border-radius:7px;
+                    border:2px solid #9aa0a6; background:#fff; margin-right:6px;
+                }}
+                QRadioButton::indicator:hover {{ border-color:{c}; }}
+                QRadioButton::indicator:checked {{
+                    background:{c}; border:2px solid {c};
+                }}
+                QRadioButton:checked {{ color:{c}; font-weight:700; }}
+
+                /* —— 复选框 —— */
+                QCheckBox::indicator {{
+                    width:16px; height:16px; border-radius:4px;
+                    border:2px solid #9aa0a6; background:#fff; margin-right:6px;
+                }}
+                QCheckBox::indicator:hover {{ border-color:{c}; }}
+                QCheckBox::indicator:checked {{
+                    image: none; background:{c}; border:2px solid {c};
+                }}
         """)
 
     # ====== Step1：选择并静默检索 ======
