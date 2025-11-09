@@ -11,16 +11,19 @@ import os, sys, importlib.util, re, copy
 from pathlib import Path
 from dataclasses import dataclass
 import unicodedata
+from collections import defaultdict
+from typing import Callable
 from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QDate, QPoint, QRect
 from PySide6.QtGui import QIcon, QPixmap, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
     QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QRadioButton, QButtonGroup,
     QCheckBox, QMessageBox, QSpacerItem, QSizePolicy, QStackedWidget, QFrame,
-    QComboBox, QScrollArea, QSpinBox, QToolButton, QListWidget,
-    QListWidgetItem, QTableWidget, QAbstractItemView, QHeaderView, QDateEdit, QLayout,
+    QComboBox, QScrollArea, QSpinBox, QToolButton,
+    QTableWidget, QAbstractItemView, QHeaderView, QDateEdit, QLayout,
     QWidgetItem
 )
+from functools import partial
 
 # ========= ORF 自搜索导入块 =========
 def _load_orf_module():
@@ -60,6 +63,8 @@ run_mode1_with_provider = getattr(_ORF, "run_mode1_with_provider", None)
 export_mode1_noninteractive = getattr(_ORF, "export_mode1_noninteractive", None)
 export_mode4_noninteractive = getattr(_ORF, "export_mode4_noninteractive", None)
 prepare_from_word = getattr(_ORF, "prepare_from_word", None)
+_distribute_by_dates = getattr(_ORF, "_distribute_by_dates", None)
+normalize_date = getattr(_ORF, "normalize_date", lambda x: x)
 _floor_label_from_name = getattr(_ORF, "_floor_label_from_name", None)
 _floor_sort_key_by_label = getattr(_ORF, "_floor_sort_key_by_label", None)
 BACKEND_TITLE = getattr(_ORF, "TITLE", "原始记录自动填写程序")
@@ -268,14 +273,32 @@ class MainWindow(QMainWindow):
         self._m1_day_forms: list[dict] = []
         self._floors_by_cat: dict[str, set[str]] = {}
         self._grouped_cache = None
+        self._cf_groups_by_floor: dict[tuple[str, str], list] = {}
 
+        self.m4_strategy = self.settings.value("mode4/strategy", "even", type=str) or "even"
+        if self.m4_strategy not in {"even", "quota"}:
+            self.m4_strategy = "even"
+        self.m4_base_entries: list[tuple[str, int | None]] = []
         self.m4_selected_floors: set[str] = set()
-        self.m4_shared_mode: bool = True
-        self.m4_entries_shared: list[tuple[str, int | None]] = []
-        self.m4_entries_by_floor: dict[str, list[tuple[str, int | None]]] = {}
-        self._cur_m4_floor: str | None = None
+        self.m4_applied_floors: set[str] = set()
+        self.m4_overrides: dict[str, list[tuple[str, int | None]]] = {}
         self.m4_all_floors: list[str] = []
         self.m4_floor_buttons: dict[str, QToolButton] = {}
+        self.m4_floor_rows: dict[str, dict] = {}
+        self.m4_preview_text: str = ""
+        self._plan_table_callbacks: dict[QTableWidget, Callable[[], None]] = {}
+
+        self.m4_fallback = self.settings.value("mode4/fallback", "append_last", type=str) or "append_last"
+        if self.m4_fallback not in {"append_last", "default", "error"}:
+            self.m4_fallback = "append_last"
+        self.m4_write_dates = bool(self.settings.value("mode4/writeDates", True, type=bool))
+        self.m4_support_strategy = self.settings.value("mode4/supportStrategy", "number", type=str) or "number"
+        if self.m4_support_strategy not in {"number", "floor"}:
+            self.m4_support_strategy = "number"
+        self.m4_net_strategy = self.settings.value("mode4/netStrategy", "number", type=str) or "number"
+        if self.m4_net_strategy not in {"number", "floor"}:
+            self.m4_net_strategy = "number"
+        self.m4_include_support = bool(self.settings.value("mode4/includeSupport", True, type=bool))
 
         self.stack = QStackedWidget()
         self.page_select = self._build_page_select()
@@ -508,42 +531,89 @@ class MainWindow(QMainWindow):
         self._update_sup_bp_ui()
         self._update_net_bp_ui()
 
-        # (E) Mode 4 表单
+                # (E) Mode 4 表单
         self.box_m4 = QGroupBox("3C. Mode 4（多日按楼层计划）")
-        lm4 = QVBoxLayout(self.box_m4)
-        lm4.setSpacing(10)
+        lm4 = QHBoxLayout(self.box_m4)
+        lm4.setSpacing(16)
 
-        self.lb_m4_hint = QLabel("请选择楼层并为所需类别配置日期与上限计划。")
+        col_left = QVBoxLayout()
+        col_left.setSpacing(12)
+        lm4.addLayout(col_left, 3)
+
+        self.lb_m4_hint = QLabel("给一批楼层套一张日程表；少数楼层再单独覆写。")
         self.lb_m4_hint.setStyleSheet("color:#555;")
-        lm4.addWidget(self.lb_m4_hint)
+        col_left.addWidget(self.lb_m4_hint)
 
-        row_m4_floor_ctrl = QHBoxLayout()
-        row_m4_floor_ctrl.addWidget(QLabel("楼层"))
-        self.btn_m4_floor_all = QPushButton("全选")
-        self.btn_m4_floor_none = QPushButton("全不选")
-        self.btn_m4_floor_base = QPushButton("仅 B 层")
-        self.btn_m4_floor_std = QPushButton("标准层")
+        self.grp_m4_step1 = QGroupBox("Step 1｜设计划（总表）")
+        step1 = QVBoxLayout(self.grp_m4_step1)
+        step1.setSpacing(8)
+
+        row_strategy = QHBoxLayout()
+        row_strategy.addWidget(QLabel("分配策略"))
+        self.rb_m4_even = QRadioButton("均分")
+        self.rb_m4_quota = QRadioButton("配额（每日上限）")
+        if self.m4_strategy == "quota":
+            self.rb_m4_quota.setChecked(True)
+        else:
+            self.rb_m4_even.setChecked(True)
+        row_strategy.addWidget(self.rb_m4_even)
+        row_strategy.addWidget(self.rb_m4_quota)
+        row_strategy.addStretch(1)
+        step1.addLayout(row_strategy)
+
+        self.tbl_m4_base = QTableWidget()
+        self._init_plan_table(self.tbl_m4_base, on_change=self._on_base_plan_changed)
+        step1.addWidget(self.tbl_m4_base)
+
+        row_plan_btn = QHBoxLayout()
+        self.btn_m4_add_base = QPushButton("+ 添加日期")
+        self.btn_m4_copy_base = QPushButton("复制上一行")
+        self.btn_m4_del_base = QPushButton("删除所选")
+        for btn in (self.btn_m4_add_base, self.btn_m4_copy_base, self.btn_m4_del_base):
+            row_plan_btn.addWidget(btn)
+        row_plan_btn.addStretch(1)
+        step1.addLayout(row_plan_btn)
+
+        self.lb_m4_base_hint = QLabel("留空上限 = 均分；最后一天自动吃掉余量。")
+        self.lb_m4_base_hint.setStyleSheet("color:#888; font-size:12px;")
+        step1.addWidget(self.lb_m4_base_hint)
+
+        col_left.addWidget(self.grp_m4_step1)
+
+        self.grp_m4_step2 = QGroupBox("Step 2｜选楼层并应用")
+        step2 = QVBoxLayout(self.grp_m4_step2)
+        step2.setSpacing(8)
+
+        ctrl_row = QHBoxLayout()
+        self.btn_m4_filter_all = QPushButton("全选")
+        self.btn_m4_filter_none = QPushButton("清空")
+        self.btn_m4_filter_basement = QPushButton("仅地下")
+        self.btn_m4_filter_digits = QPushButton("仅数字层")
+        self.btn_m4_filter_me = QPushButton("机房")
+        self.btn_m4_filter_roof = QPushButton("屋面")
         for btn in (
-            self.btn_m4_floor_all,
-            self.btn_m4_floor_none,
-            self.btn_m4_floor_base,
-            self.btn_m4_floor_std,
+            self.btn_m4_filter_all,
+            self.btn_m4_filter_none,
+            self.btn_m4_filter_basement,
+            self.btn_m4_filter_digits,
+            self.btn_m4_filter_me,
+            self.btn_m4_filter_roof,
         ):
             btn.setFixedHeight(28)
-            row_m4_floor_ctrl.addWidget(btn)
-        row_m4_floor_ctrl.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
-        lm4.addLayout(row_m4_floor_ctrl)
+            ctrl_row.addWidget(btn)
+        ctrl_row.addStretch(1)
+        step2.addLayout(ctrl_row)
 
         self.m4_floor_chip_container = QWidget()
         self.m4_floor_chips = FlowLayout(self.m4_floor_chip_container)
         self.m4_floor_chips.setContentsMargins(0, 0, 0, 0)
         self.m4_floor_chips.setSpacing(6)
         self.m4_floor_chip_container.setLayout(self.m4_floor_chips)
-        lm4.addWidget(self.m4_floor_chip_container)
+        step2.addWidget(self.m4_floor_chip_container)
 
         self.lb_m4_floors = QLabel("")
         self.lb_m4_floors.setStyleSheet("color:#888; font-size:12px;")
-        lm4.addWidget(self.lb_m4_floors)
+        step2.addWidget(self.lb_m4_floors)
 
         row_m4_cats = QHBoxLayout()
         row_m4_cats.addWidget(QLabel("类别"))
@@ -558,103 +628,110 @@ class MainWindow(QMainWindow):
             self.sw_m4_cat_net,
         ):
             row_m4_cats.addWidget(sw)
-        row_m4_cats.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
-        lm4.addLayout(row_m4_cats)
+        row_m4_cats.addStretch(1)
+        step2.addLayout(row_m4_cats)
 
-        row_m4_opts = QHBoxLayout()
-        self.lb_m4_sup_strategy = QLabel("支撑分段")
-        self.cmb_m4_sup_strategy = QComboBox(); self.cmb_m4_sup_strategy.addItems(["编号", "楼层"])
-        self.lb_m4_net_strategy = QLabel("网架分段")
-        self.cmb_m4_net_strategy = QComboBox(); self.cmb_m4_net_strategy.addItems(["编号", "楼层"])
-        self.ck_m4_support = QCheckBox("包含支撑")
-        self.ck_m4_support.setChecked(True)
-        for wdg in (
-            self.lb_m4_sup_strategy,
-            self.cmb_m4_sup_strategy,
-            self.lb_m4_net_strategy,
-            self.cmb_m4_net_strategy,
-            self.ck_m4_support,
-        ):
-            row_m4_opts.addWidget(wdg)
-        row_m4_opts.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
-        lm4.addLayout(row_m4_opts)
+        self.btn_m4_apply_plan = QPushButton("将上方计划应用到这些楼层")
+        self.btn_m4_apply_plan.setFixedHeight(34)
+        step2.addWidget(self.btn_m4_apply_plan)
 
-        plan_box = QGroupBox("计划编辑")
-        plan_lay = QVBoxLayout(plan_box)
-        plan_lay.setSpacing(8)
+        self.scroll_m4_applied = QScrollArea()
+        self.scroll_m4_applied.setWidgetResizable(True)
+        self.w_m4_applied = QWidget()
+        self.lay_m4_applied = QVBoxLayout(self.w_m4_applied)
+        self.lay_m4_applied.setContentsMargins(0, 0, 0, 0)
+        self.lay_m4_applied.setSpacing(6)
+        self.lay_m4_applied.addStretch(1)
+        self.scroll_m4_applied.setWidget(self.w_m4_applied)
+        step2.addWidget(self.scroll_m4_applied)
 
-        row_mode = QHBoxLayout()
-        self.rb_m4_shared = QRadioButton("共用计划")
-        self.rb_m4_byfloor = QRadioButton("分楼层计划")
-        self.rb_m4_shared.setChecked(True)
-        row_mode.addWidget(self.rb_m4_shared)
-        row_mode.addWidget(self.rb_m4_byfloor)
-        row_mode.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
-        plan_lay.addLayout(row_mode)
+        col_left.addWidget(self.grp_m4_step2, 1)
 
-        plan_body = QHBoxLayout()
-        self.lv_m4_floors = QListWidget()
-        self.lv_m4_floors.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.lv_m4_floors.setFixedWidth(140)
-        plan_body.addWidget(self.lv_m4_floors)
+        self.grp_m4_step3 = QGroupBox("Step 3｜未分配处理")
+        step3 = QVBoxLayout(self.grp_m4_step3)
+        step3.setSpacing(8)
 
-        self.tbl_m4_plan = QTableWidget()
-        self._init_plan_table(self.tbl_m4_plan)
-        plan_body.addWidget(self.tbl_m4_plan, 1)
-        plan_lay.addLayout(plan_body)
-
-        row_plan_btn = QHBoxLayout()
-        self.btn_m4_addrow = QPushButton("+ 添加日期")
-        self.btn_m4_delrow = QPushButton("- 删除所选")
-        self.btn_m4_even = QPushButton("均分上限")
-        self.btn_m4_copy2all = QPushButton("复制到已选楼层")
-        for btn in (
-            self.btn_m4_addrow,
-            self.btn_m4_delrow,
-            self.btn_m4_even,
-            self.btn_m4_copy2all,
-        ):
-            row_plan_btn.addWidget(btn)
-        row_plan_btn.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
-        plan_lay.addLayout(row_plan_btn)
-        self.btn_m4_copy2all.hide()
-
-        lm4.addWidget(plan_box)
-
-        row_m4_fallback = QHBoxLayout()
-        row_m4_fallback.addWidget(QLabel("未分配处理"))
-        self.cmb_m4_fallback = QComboBox()
-        self.cmb_m4_fallback.addItems(["并入最后一天", "使用默认计划", "报错"])
-        row_m4_fallback.addWidget(self.cmb_m4_fallback)
-        row_m4_fallback.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
-        lm4.addLayout(row_m4_fallback)
+        row_fb = QHBoxLayout()
+        row_fb.addWidget(QLabel("未分配"))
+        self.rb_m4_fb_append = QRadioButton("并入最后一天")
+        self.rb_m4_fb_default = QRadioButton("回落到 Mode 1（日期分桶）")
+        self.rb_m4_fb_error = QRadioButton("停止并提示")
+        fb_map = {
+            "append_last": self.rb_m4_fb_append,
+            "default": self.rb_m4_fb_default,
+            "error": self.rb_m4_fb_error,
+        }
+        fb_map.get(self.m4_fallback, self.rb_m4_fb_append).setChecked(True)
+        for rb in (self.rb_m4_fb_append, self.rb_m4_fb_default, self.rb_m4_fb_error):
+            row_fb.addWidget(rb)
+        row_fb.addStretch(1)
+        step3.addLayout(row_fb)
 
         self.w_m4_default = QWidget()
         lay_def = QVBoxLayout(self.w_m4_default)
         lay_def.setContentsMargins(0, 0, 0, 0)
-        lay_def.setSpacing(8)
+        lay_def.setSpacing(6)
         self.tbl_m4_default = QTableWidget()
-        self._init_plan_table(self.tbl_m4_default)
+        self._init_plan_table(self.tbl_m4_default, on_change=self._on_default_plan_changed)
         lay_def.addWidget(self.tbl_m4_default)
         row_def_btn = QHBoxLayout()
         self.btn_m4_def_add = QPushButton("+ 添加日期")
-        self.btn_m4_def_del = QPushButton("- 删除所选")
-        self.btn_m4_def_even = QPushButton("均分上限")
-        for btn in (self.btn_m4_def_add, self.btn_m4_def_del, self.btn_m4_def_even):
+        self.btn_m4_def_copy = QPushButton("复制上一行")
+        self.btn_m4_def_del = QPushButton("删除所选")
+        for btn in (self.btn_m4_def_add, self.btn_m4_def_copy, self.btn_m4_def_del):
             row_def_btn.addWidget(btn)
-        row_def_btn.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        row_def_btn.addStretch(1)
         lay_def.addLayout(row_def_btn)
-        lm4.addWidget(self.w_m4_default)
-        self.w_m4_default.setVisible(False)
+        step3.addWidget(self.w_m4_default)
+
+        row_support = QHBoxLayout()
+        self.ck_m4_support = QCheckBox("包含支撑")
+        self.ck_m4_support.setChecked(self.m4_include_support)
+        self.lb_m4_sup_strategy = QLabel("支撑分桶")
+        self.cmb_m4_sup_strategy = QComboBox()
+        self.cmb_m4_sup_strategy.addItems(["按编号", "按楼层"])
+        self.cmb_m4_sup_strategy.setCurrentIndex(1 if self.m4_support_strategy == "floor" else 0)
+        self.lb_m4_net_strategy = QLabel("网架分桶")
+        self.cmb_m4_net_strategy = QComboBox()
+        self.cmb_m4_net_strategy.addItems(["按编号", "按楼层"])
+        self.cmb_m4_net_strategy.setCurrentIndex(1 if self.m4_net_strategy == "floor" else 0)
+        for w in (
+            self.ck_m4_support,
+            self.lb_m4_sup_strategy,
+            self.cmb_m4_sup_strategy,
+            self.lb_m4_net_strategy,
+            self.cmb_m4_net_strategy,
+        ):
+            row_support.addWidget(w)
+        row_support.addStretch(1)
+        step3.addLayout(row_support)
+
+        self.ck_m4_write_dates = QCheckBox("写入日期到表头")
+        self.ck_m4_write_dates.setChecked(self.m4_write_dates)
+        step3.addWidget(self.ck_m4_write_dates)
 
         row_go_m4 = QHBoxLayout()
-        row_go_m4.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum))
         self.btn_run_m4 = QPushButton("生成（Mode 4）")
-        self.btn_run_m4.setFixedSize(QSize(180, 36))
+        self.btn_run_m4.setFixedSize(QSize(200, 40))
         row_go_m4.addWidget(self.btn_run_m4)
-        lm4.addLayout(row_go_m4)
+        self.lb_m4_summary = QLabel("")
+        self.lb_m4_summary.setStyleSheet("color:#555;")
+        row_go_m4.addStretch(1)
+        row_go_m4.addWidget(self.lb_m4_summary)
+        step3.addLayout(row_go_m4)
 
-        # 容器：只显示当前模式对应的表单
+        col_left.addWidget(self.grp_m4_step3)
+
+        preview_box = QGroupBox("实时预览")
+        lp = QVBoxLayout(preview_box)
+        lp.setSpacing(8)
+        self.lb_m4_preview = QLabel("请先设计划")
+        self.lb_m4_preview.setWordWrap(True)
+        self.lb_m4_preview.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        lp.addWidget(self.lb_m4_preview)
+        lm4.addWidget(preview_box, 2)
+
+# 容器：只显示当前模式对应的表单
         self.panel_wrap = QVBoxLayout()
         self.panel_wrap.addWidget(self.box_m1)
         self.panel_wrap.addWidget(self.box_m2)  # 默认显示 M2
@@ -681,27 +758,37 @@ class MainWindow(QMainWindow):
         self.btn_run_m2.clicked.connect(self._on_run_mode2)
         self.btn_run_m3.clicked.connect(self._on_run_mode3)
         self.btn_run_m4.clicked.connect(self._on_run_mode4)
-        self.cmb_m4_fallback.currentIndexChanged.connect(self._on_m4_fallback_changed)
-        self.ck_m4_support.toggled.connect(self._on_m4_support_toggled)
-        self.btn_m4_floor_all.clicked.connect(self._m4_select_all_floors)
-        self.btn_m4_floor_none.clicked.connect(self._m4_clear_all_floors)
-        self.btn_m4_floor_base.clicked.connect(self._m4_select_basement_only)
-        self.btn_m4_floor_std.clicked.connect(self._m4_select_standard_only)
-        self.rb_m4_shared.toggled.connect(self._on_shared_mode_changed)
-        self.rb_m4_byfloor.toggled.connect(self._on_shared_mode_changed)
-        self.lv_m4_floors.itemSelectionChanged.connect(self._on_floor_selected_change)
-        self.btn_m4_addrow.clicked.connect(lambda: self._plan_table_add_row(self.tbl_m4_plan))
-        self.btn_m4_delrow.clicked.connect(lambda: self._plan_table_remove_selected(self.tbl_m4_plan))
-        self.btn_m4_even.clicked.connect(lambda: self._on_even_clicked(self.tbl_m4_plan))
-        self.btn_m4_copy2all.clicked.connect(self._on_copy_to_all)
+        self.rb_m4_even.toggled.connect(lambda on: on and self._on_m4_strategy_changed("even"))
+        self.rb_m4_quota.toggled.connect(lambda on: on and self._on_m4_strategy_changed("quota"))
+        self.btn_m4_add_base.clicked.connect(lambda: self._plan_table_add_row(self.tbl_m4_base))
+        self.btn_m4_copy_base.clicked.connect(lambda: self._plan_table_copy_last(self.tbl_m4_base))
+        self.btn_m4_del_base.clicked.connect(lambda: self._plan_table_remove_selected(self.tbl_m4_base))
+        self.btn_m4_filter_all.clicked.connect(lambda: self._m4_apply_filter("all"))
+        self.btn_m4_filter_none.clicked.connect(lambda: self._m4_apply_filter("none"))
+        self.btn_m4_filter_basement.clicked.connect(lambda: self._m4_apply_filter("basement"))
+        self.btn_m4_filter_digits.clicked.connect(lambda: self._m4_apply_filter("digits"))
+        self.btn_m4_filter_me.clicked.connect(lambda: self._m4_apply_filter("me"))
+        self.btn_m4_filter_roof.clicked.connect(lambda: self._m4_apply_filter("roof"))
+        self.btn_m4_apply_plan.clicked.connect(self._on_apply_plan_clicked)
         self.btn_m4_def_add.clicked.connect(lambda: self._plan_table_add_row(self.tbl_m4_default))
+        self.btn_m4_def_copy.clicked.connect(lambda: self._plan_table_copy_last(self.tbl_m4_default))
         self.btn_m4_def_del.clicked.connect(lambda: self._plan_table_remove_selected(self.tbl_m4_default))
-        self.btn_m4_def_even.clicked.connect(lambda: self._on_even_clicked(self.tbl_m4_default))
+        self.rb_m4_fb_append.toggled.connect(lambda _: self._on_m4_fallback_changed())
+        self.rb_m4_fb_default.toggled.connect(lambda _: self._on_m4_fallback_changed())
+        self.rb_m4_fb_error.toggled.connect(lambda _: self._on_m4_fallback_changed())
+        self.ck_m4_support.toggled.connect(self._on_m4_support_toggled)
+        self.cmb_m4_sup_strategy.currentIndexChanged.connect(self._on_support_strategy_changed)
+        self.cmb_m4_net_strategy.currentIndexChanged.connect(self._on_net_strategy_changed)
+        self.ck_m4_write_dates.toggled.connect(self._on_m4_write_dates_changed)
+        for sw in (self.sw_m4_cat_gz, self.sw_m4_cat_gl, self.sw_m4_cat_sup, self.sw_m4_cat_net):
+            sw.toggled.connect(self._on_categories_changed)
 
         self._apply_detection_to_mode1_ui()
-        self._on_m4_support_toggled(self.ck_m4_support.isChecked())
-        self._on_m4_fallback_changed(self.cmb_m4_fallback.currentIndex())
-        self._on_shared_mode_changed()
+        self._on_support_strategy_changed()
+        self._on_net_strategy_changed()
+        self._on_m4_fallback_changed()
+        self._refresh_m4_default_visibility()
+        self._refresh_m4_strategy_ui()
 
         return w
 
@@ -998,6 +1085,7 @@ class MainWindow(QMainWindow):
             return
         if self.doc_path is None or prepare_from_word is None:
             self._floors_by_cat = {}
+            self._cf_groups_by_floor = {}
             return
         if self._grouped_cache is not None and self._floors_by_cat:
             return
@@ -1006,9 +1094,11 @@ class MainWindow(QMainWindow):
         except Exception:
             self._grouped_cache = None
             self._floors_by_cat = {}
+            self._cf_groups_by_floor = {}
             return
         self._grouped_cache = grouped
         floors: dict[str, set[str]] = {}
+        cf_groups: dict[tuple[str, str], list] = defaultdict(list)
         for cat, groups in (grouped or {}).items():
             labels = set()
             for g in groups:
@@ -1025,24 +1115,91 @@ class MainWindow(QMainWindow):
                         label = None
                 if label and label != "F?":
                     labels.add(label)
+                    cf_groups[(cat, label)].append(g)
             if labels:
                 floors[cat] = labels
         self._floors_by_cat = floors
+        self._cf_groups_by_floor = cf_groups
 
-    def _init_plan_table(self, table: QTableWidget):
-        table.setColumnCount(3)
-        table.setHorizontalHeaderLabels(["日期", "上限", "不限"])
+    def _apply_detection_to_mode4_ui(self):
+        if not hasattr(self, "m4_floor_chips"):
+            return
+        gz_ok = self.present.get("钢柱", False)
+        gl_ok = self.present.get("钢梁", False)
+        sup_ok = self.present.get("支撑", False)
+        net_ok = self.present.get("网架", False)
+
+        for ok, widget in [
+            (gz_ok, getattr(self, "sw_m4_cat_gz", None)),
+            (gl_ok, getattr(self, "sw_m4_cat_gl", None)),
+            (sup_ok, getattr(self, "sw_m4_cat_sup", None)),
+            (net_ok, getattr(self, "sw_m4_cat_net", None)),
+        ]:
+            if isinstance(widget, QCheckBox):
+                widget.setVisible(ok)
+                widget.setEnabled(ok)
+                if ok and not widget.isChecked():
+                    widget.setChecked(True)
+                if not ok:
+                    widget.setChecked(False)
+
+        if isinstance(self.ck_m4_support, QCheckBox):
+            self.ck_m4_support.setVisible(sup_ok)
+            self.ck_m4_support.setEnabled(sup_ok)
+            self.ck_m4_support.setChecked(self.m4_include_support and sup_ok)
+            self._on_m4_support_toggled(self.ck_m4_support.isChecked())
+
+        if isinstance(self.cmb_m4_sup_strategy, QComboBox):
+            self.cmb_m4_sup_strategy.setCurrentIndex(1 if self.m4_support_strategy == "floor" else 0)
+        if isinstance(self.cmb_m4_net_strategy, QComboBox):
+            self.cmb_m4_net_strategy.setCurrentIndex(1 if self.m4_net_strategy == "floor" else 0)
+
+        sorter = _floor_sort_key_by_label or (lambda x: x)
+        floors_set: set[str] = set()
+        for cat in ("钢柱", "钢梁", "支撑", "网架"):
+            floors_set.update(self._floors_by_cat.get(cat, set()))
+        floors = sorted(floors_set, key=sorter)
+        self.m4_all_floors = floors
+        self._rebuild_m4_floor_chips(floors)
+        self._m4_set_selected_floors(set(floors))
+        self.m4_applied_floors = set(floors)
+        self._sync_m4_applied_rows()
+        self._update_m4_floor_hint()
+        self._refresh_m4_default_visibility()
+        self._refresh_m4_strategy_ui()
+        self._refresh_m4_preview()
+
+    def _update_m4_floor_hint(self):
+        if not hasattr(self, "lb_m4_floors"):
+            return
+        if not self._floors_by_cat:
+            self.lb_m4_floors.setText("（楼层信息将在读取后显示）")
+            return
+        sorter = _floor_sort_key_by_label or (lambda x: x)
+        parts = []
+        for cat in ("钢柱", "钢梁", "支撑", "网架"):
+            floors = sorted(self._floors_by_cat.get(cat, []), key=sorter)
+            if floors:
+                parts.append(f"{cat}：{' '.join(floors)}")
+        self.lb_m4_floors.setText(" | ".join(parts))
+
+    def _init_plan_table(self, table: QTableWidget, *, on_change: Callable[[], None] | None = None):
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["日期", "上限"])
         header = table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         table.verticalHeader().setVisible(False)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setAlternatingRowColors(True)
+        if on_change:
+            self._plan_table_callbacks[table] = on_change
+        else:
+            self._plan_table_callbacks.pop(table, None)
 
-    def _plan_table_add_row(self, table: QTableWidget, entry: tuple[str, int | None] | None = None):
+    def _plan_table_add_row(self, table: QTableWidget, entry: tuple[str, int] | None = None, *, suppress_trigger: bool = False):
         row = table.rowCount()
         table.insertRow(row)
 
@@ -1061,48 +1218,42 @@ class MainWindow(QMainWindow):
         limit_spin = QSpinBox()
         limit_spin.setRange(0, 999999)
         limit_spin.setSingleStep(5)
-        unlimited_check = QCheckBox()
-
-        if entry is not None and entry[1] is not None:
-            limit_spin.setValue(int(entry[1]))
-            unlimited_check.setChecked(False)
-            limit_spin.setEnabled(True)
-        else:
-            if entry and entry[1] is not None:
-                limit_spin.setValue(int(entry[1]))
-            else:
+        limit_spin.setSpecialValueText("不限")
+        if entry is not None:
+            try:
+                limit_spin.setValue(max(0, int(entry[1])))
+            except Exception:
                 limit_spin.setValue(0)
-            unlimited_check.setChecked(entry is not None and entry[1] is None)
-            limit_spin.setEnabled(not unlimited_check.isChecked())
+        else:
+            limit_spin.setValue(0)
 
-        def _on_toggle_unlimited(on: bool, spin: QSpinBox = limit_spin):
-            spin.setEnabled(not on)
-
-        unlimited_check.toggled.connect(_on_toggle_unlimited)
+        date_edit.dateChanged.connect(lambda _=None, tbl=table: self._trigger_plan_change(tbl))
+        limit_spin.valueChanged.connect(lambda _=None, tbl=table: self._trigger_plan_change(tbl))
 
         table.setCellWidget(row, 0, date_edit)
         table.setCellWidget(row, 1, limit_spin)
-        table.setCellWidget(row, 2, unlimited_check)
         table.setRowHeight(row, 32)
+        if not suppress_trigger:
+            self._trigger_plan_change(table)
 
-    def _plan_table_set_entries(self, table: QTableWidget, entries: list[tuple[str, int | None]]):
+    def _plan_table_set_entries(self, table: QTableWidget, entries: list[tuple[str, int]], *, suppress_trigger: bool = False):
+        block = table.blockSignals(True)
         table.setRowCount(0)
         for entry in entries or []:
-            self._plan_table_add_row(table, entry)
+            self._plan_table_add_row(table, entry, suppress_trigger=True)
+        table.blockSignals(block)
+        if not suppress_trigger:
+            self._trigger_plan_change(table)
 
-    def _plan_table_collect(self, table: QTableWidget) -> list[tuple[str, int | None]]:
-        results: list[tuple[str, int | None]] = []
+    def _plan_table_collect(self, table: QTableWidget) -> list[tuple[str, int]]:
+        results: list[tuple[str, int]] = []
         for row in range(table.rowCount()):
             date_edit = table.cellWidget(row, 0)
             limit_widget = table.cellWidget(row, 1)
-            unlimited_widget = table.cellWidget(row, 2)
-            if not isinstance(date_edit, QDateEdit) or not isinstance(limit_widget, QSpinBox) or not isinstance(unlimited_widget, QCheckBox):
+            if not isinstance(date_edit, QDateEdit) or not isinstance(limit_widget, QSpinBox):
                 continue
             date_str = date_edit.date().toString("yyyy-M-d")
-            if unlimited_widget.isChecked():
-                results.append((date_str, None))
-            else:
-                results.append((date_str, int(limit_widget.value())))
+            results.append((date_str, int(limit_widget.value())))
         return results
 
     def _plan_table_remove_selected(self, table: QTableWidget):
@@ -1111,97 +1262,24 @@ class MainWindow(QMainWindow):
             selected_rows = [table.rowCount() - 1]
         for row in selected_rows:
             table.removeRow(row)
+        self._trigger_plan_change(table)
 
-    def _on_even_clicked(self, table: QTableWidget):
-        limited_rows: list[tuple[int, QSpinBox]] = []
-        total = 0
-        for row in range(table.rowCount()):
-            limit_widget = table.cellWidget(row, 1)
-            unlimited_widget = table.cellWidget(row, 2)
-            if not isinstance(limit_widget, QSpinBox) or not isinstance(unlimited_widget, QCheckBox):
-                continue
-            if unlimited_widget.isChecked():
-                continue
-            limited_rows.append((row, limit_widget))
-            total += int(limit_widget.value())
-        if not limited_rows or total <= 0:
+    def _plan_table_copy_last(self, table: QTableWidget):
+        if table.rowCount() == 0:
+            self._plan_table_add_row(table)
             return
-        base = total // len(limited_rows)
-        extra = total % len(limited_rows)
-        for idx, (_row, spin) in enumerate(limited_rows):
-            spin.setValue(base + (1 if idx < extra else 0))
+        last = table.rowCount() - 1
+        date_edit = table.cellWidget(last, 0)
+        limit_widget = table.cellWidget(last, 1)
+        entry: tuple[str, int] | None = None
+        if isinstance(date_edit, QDateEdit) and isinstance(limit_widget, QSpinBox):
+            entry = (date_edit.date().toString("yyyy-M-d"), int(limit_widget.value()))
+        self._plan_table_add_row(table, entry)
 
-    def _save_current_floor_entries(self):
-        if not hasattr(self, "tbl_m4_plan"):
-            return
-        if self.m4_shared_mode:
-            self.m4_entries_shared = self._plan_table_collect(self.tbl_m4_plan)
-        else:
-            if self._cur_m4_floor:
-                self.m4_entries_by_floor[self._cur_m4_floor] = self._plan_table_collect(self.tbl_m4_plan)
-
-    def _load_entries_for_current_floor(self):
-        if not hasattr(self, "tbl_m4_plan"):
-            return
-        if self.m4_shared_mode:
-            self._plan_table_set_entries(self.tbl_m4_plan, self.m4_entries_shared)
-        else:
-            if self._cur_m4_floor:
-                entries = self.m4_entries_by_floor.get(self._cur_m4_floor, [])
-                self._plan_table_set_entries(self.tbl_m4_plan, entries)
-            else:
-                self._plan_table_set_entries(self.tbl_m4_plan, [])
-
-    def _current_selected_floor(self) -> str | None:
-        if not hasattr(self, "lv_m4_floors"):
-            return None
-        item = self.lv_m4_floors.currentItem()
-        return item.text() if item else None
-
-    def _refresh_m4_floor_list(self):
-        if not hasattr(self, "lv_m4_floors"):
-            return
-        sorter = _floor_sort_key_by_label or (lambda x: x)
-        available = sorted(self.m4_selected_floors, key=sorter)
-        previous = self._cur_m4_floor if self._cur_m4_floor in self.m4_selected_floors else None
-        if not previous and available:
-            previous = available[0]
-        self.lv_m4_floors.blockSignals(True)
-        self.lv_m4_floors.clear()
-        for floor in available:
-            item = QListWidgetItem(floor)
-            self.lv_m4_floors.addItem(item)
-            if floor == previous:
-                item.setSelected(True)
-                self.lv_m4_floors.setCurrentItem(item)
-        self.lv_m4_floors.blockSignals(False)
-        if self.m4_shared_mode:
-            self._cur_m4_floor = None
-            self._load_entries_for_current_floor()
-        else:
-            self._cur_m4_floor = previous
-            self._load_entries_for_current_floor()
-        if hasattr(self, "btn_m4_copy2all"):
-            self.btn_m4_copy2all.setEnabled(bool(available))
-
-    def _m4_set_selected_floors(self, floors: set[str]):
-        self.m4_selected_floors = set(floors)
-        for name, btn in self.m4_floor_buttons.items():
-            btn.blockSignals(True)
-            btn.setChecked(name in self.m4_selected_floors)
-            btn.blockSignals(False)
-        self._refresh_m4_floor_list()
-
-    def _m4_on_floor_chip_toggled(self, name: str, checked: bool):
-        self._save_current_floor_entries()
-        if checked:
-            self.m4_selected_floors.add(name)
-        else:
-            self.m4_selected_floors.discard(name)
-            if self._cur_m4_floor == name:
-                self._cur_m4_floor = None
-        self._refresh_m4_floor_list()
-
+    def _trigger_plan_change(self, table: QTableWidget):
+        cb = self._plan_table_callbacks.get(table)
+        if cb:
+            cb()
     def _rebuild_m4_floor_chips(self, floors: list[str]):
         if not hasattr(self, "m4_floor_chips"):
             return
@@ -1221,321 +1299,419 @@ class MainWindow(QMainWindow):
             btn.toggled.connect(lambda on, name=floor: self._m4_on_floor_chip_toggled(name, on))
             self.m4_floor_chips.addWidget(btn)
             self.m4_floor_buttons[floor] = btn
+        if floors:
+            self._m4_set_selected_floors(self.m4_selected_floors & set(floors))
 
     def _reset_m4_plan_state(self):
         self.m4_selected_floors = set()
-        self.m4_entries_shared = []
-        self.m4_entries_by_floor = {}
-        self.m4_all_floors = []
-        self._cur_m4_floor = None
+        self.m4_applied_floors = set()
+        self.m4_overrides = {}
         self.m4_floor_buttons = {}
-        self.m4_shared_mode = True
-        if hasattr(self, "tbl_m4_plan"):
-            self._plan_table_set_entries(self.tbl_m4_plan, [])
+        self.m4_floor_rows = {}
+        self.m4_preview_text = ""
+        self.m4_base_entries = []
+        if hasattr(self, "tbl_m4_base"):
+            self._plan_table_set_entries(self.tbl_m4_base, [], suppress_trigger=True)
+            self._plan_table_add_row(self.tbl_m4_base, suppress_trigger=True)
+            self._trigger_plan_change(self.tbl_m4_base)
         if hasattr(self, "tbl_m4_default"):
-            self._plan_table_set_entries(self.tbl_m4_default, [])
-        if hasattr(self, "lv_m4_floors"):
-            self.lv_m4_floors.clear()
-        if hasattr(self, "rb_m4_shared"):
-            self.rb_m4_shared.setChecked(True)
-        if hasattr(self, "btn_m4_copy2all"):
-            self.btn_m4_copy2all.hide()
+            self._plan_table_set_entries(self.tbl_m4_default, [], suppress_trigger=True)
+        if hasattr(self, "lay_m4_applied"):
+            while self.lay_m4_applied.count() > 1:
+                item = self.lay_m4_applied.takeAt(0)
+                if item and item.widget():
+                    item.widget().deleteLater()
+        self._refresh_m4_summary_label()
+        self._refresh_m4_preview()
 
-    def _m4_select_all_floors(self):
-        self._save_current_floor_entries()
-        self._m4_set_selected_floors(set(self.m4_all_floors))
-
-    def _m4_clear_all_floors(self):
-        self._save_current_floor_entries()
-        self._m4_set_selected_floors(set())
-
-    def _m4_select_basement_only(self):
-        self._save_current_floor_entries()
-        selected = {f for f in self.m4_all_floors if f.upper().startswith("B")}
+    def _m4_apply_filter(self, kind: str):
+        if not self.m4_all_floors:
+            return
+        kind = (kind or "all").lower()
+        if kind == "none":
+            selected: set[str] = set()
+        elif kind == "basement":
+            selected = {f for f in self.m4_all_floors if f.upper().startswith("B")}
+        elif kind == "digits":
+            selected = {f for f in self.m4_all_floors if re.fullmatch(r"\d+F", f.upper())}
+        elif kind == "me":
+            selected = {f for f in self.m4_all_floors if "机房" in f}
+        elif kind == "roof":
+            selected = {f for f in self.m4_all_floors if "屋面" in f}
+        else:
+            selected = set(self.m4_all_floors)
         self._m4_set_selected_floors(selected)
 
-    def _m4_select_standard_only(self):
-        self._save_current_floor_entries()
-        selected = {f for f in self.m4_all_floors if re.match(r"\d+F", f.upper())}
-        self._m4_set_selected_floors(selected)
+    def _m4_set_selected_floors(self, floors: set[str]):
+        floors = floors & set(self.m4_all_floors)
+        self.m4_selected_floors = floors
+        for floor, btn in self.m4_floor_buttons.items():
+            block = btn.blockSignals(True)
+            btn.setChecked(floor in floors)
+            btn.blockSignals(block)
 
-    def _on_shared_mode_changed(self):
-        if not hasattr(self, "rb_m4_shared"):
-            return
-        self._save_current_floor_entries()
-        self.m4_shared_mode = self.rb_m4_shared.isChecked()
-        self.lv_m4_floors.setDisabled(self.m4_shared_mode)
-        self.btn_m4_copy2all.setVisible(not self.m4_shared_mode)
-        if self.m4_shared_mode:
-            self._cur_m4_floor = None
+    def _m4_on_floor_chip_toggled(self, name: str, checked: bool):
+        if checked:
+            self.m4_selected_floors.add(name)
         else:
-            current = self._current_selected_floor()
-            if current:
-                self._cur_m4_floor = current
-            elif self.m4_selected_floors:
-                sorter = _floor_sort_key_by_label or (lambda x: x)
-                ordered = sorted(self.m4_selected_floors, key=sorter)
-                self._cur_m4_floor = ordered[0] if ordered else None
-                if self._cur_m4_floor:
-                    items = self.lv_m4_floors.findItems(self._cur_m4_floor, Qt.MatchExactly)
-                    if items:
-                        self.lv_m4_floors.setCurrentItem(items[0])
-        self._load_entries_for_current_floor()
+            self.m4_selected_floors.discard(name)
 
-    def _on_floor_selected_change(self):
-        if self.m4_shared_mode:
+    def _create_floor_row(self, floor: str) -> QFrame:
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame_lay = QVBoxLayout(frame)
+        frame_lay.setContentsMargins(12, 8, 12, 8)
+        frame_lay.setSpacing(6)
+
+        header = QHBoxLayout()
+        badge = QLabel(floor)
+        badge.setStyleSheet("background:#eef2ff; padding:2px 10px; border-radius:10px; font-weight:600;")
+        header.addWidget(badge)
+        summary = QLabel("未设置")
+        summary.setStyleSheet("color:#555;")
+        header.addWidget(summary, 1)
+        toggle = QToolButton()
+        toggle.setText("自定义")
+        toggle.setCheckable(True)
+        header.addWidget(toggle)
+        header.addStretch(1)
+        frame_lay.addLayout(header)
+
+        editor = QWidget()
+        editor_lay = QVBoxLayout(editor)
+        editor_lay.setContentsMargins(0, 0, 0, 0)
+        editor_lay.setSpacing(6)
+        table = QTableWidget()
+        self._init_plan_table(table, on_change=lambda floor=floor: self._on_floor_plan_changed(floor))
+        editor_lay.addWidget(table)
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("+ 添加日期")
+        btn_copy = QPushButton("复制上一行")
+        btn_del = QPushButton("删除所选")
+        for btn in (btn_add, btn_copy, btn_del):
+            btn_row.addWidget(btn)
+        btn_row.addStretch(1)
+        editor_lay.addLayout(btn_row)
+        editor.setVisible(False)
+        frame_lay.addWidget(editor)
+
+        btn_add.clicked.connect(lambda _, tbl=table: self._plan_table_add_row(tbl))
+        btn_copy.clicked.connect(lambda _, tbl=table: self._plan_table_copy_last(tbl))
+        btn_del.clicked.connect(lambda _, tbl=table: self._plan_table_remove_selected(tbl))
+        toggle.toggled.connect(lambda checked, floor=floor: self._on_floor_customize_toggled(floor, checked))
+
+        self.m4_floor_rows[floor] = {
+            "frame": frame,
+            "summary": summary,
+            "toggle": toggle,
+            "table": table,
+            "editor": editor,
+        }
+        return frame
+
+    def _sync_m4_applied_rows(self):
+        if not hasattr(self, "lay_m4_applied"):
             return
-        self._save_current_floor_entries()
-        self._cur_m4_floor = self._current_selected_floor()
-        self._load_entries_for_current_floor()
+        current = set(self.m4_floor_rows.keys())
+        for floor in list(current - self.m4_applied_floors):
+            info = self.m4_floor_rows.pop(floor, None)
+            if info and info.get("frame"):
+                info["frame"].setParent(None)
+                info["frame"].deleteLater()
+        for floor in sorted(self.m4_applied_floors):
+            if floor not in self.m4_floor_rows:
+                frame = self._create_floor_row(floor)
+                self.lay_m4_applied.insertWidget(self.lay_m4_applied.count() - 1, frame)
+        for floor in self.m4_applied_floors:
+            self._update_floor_summary(floor)
+        self._refresh_m4_strategy_ui()
+        self._refresh_m4_summary_label()
 
-    def _on_copy_to_all(self):
-        if self.m4_shared_mode:
+    def _update_floor_summary(self, floor: str):
+        info = self.m4_floor_rows.get(floor)
+        if not info:
             return
-        entries = self._plan_table_collect(self.tbl_m4_plan)
-        for floor in self.m4_selected_floors:
-            self.m4_entries_by_floor[floor] = list(entries)
-
-    def _collect_m4_plan_from_ui(self) -> dict:
-        if not hasattr(self, "tbl_m4_plan"):
-            return {}
-        self._save_current_floor_entries()
-
-        categories: list[str] = []
-        if self.sw_m4_cat_gz.isVisible() and self.sw_m4_cat_gz.isEnabled() and self.sw_m4_cat_gz.isChecked():
-            categories.append("钢柱")
-        if self.sw_m4_cat_gl.isVisible() and self.sw_m4_cat_gl.isEnabled() and self.sw_m4_cat_gl.isChecked():
-            categories.append("钢梁")
-        if self.sw_m4_cat_sup.isVisible() and self.sw_m4_cat_sup.isEnabled() and self.sw_m4_cat_sup.isChecked():
-            categories.append("支撑")
-        if self.sw_m4_cat_net.isVisible() and self.sw_m4_cat_net.isEnabled() and self.sw_m4_cat_net.isChecked():
-            categories.append("网架")
-
-        include_support = (
-            self.ck_m4_support.isVisible()
-            and self.ck_m4_support.isEnabled()
-            and self.ck_m4_support.isChecked()
-        )
-
-        if not include_support and "支撑" in categories:
-            categories.remove("支撑")
-
-        if not categories or not self.m4_selected_floors:
-            return {}
-
-        if self.m4_shared_mode:
-            self.m4_entries_shared = self._plan_table_collect(self.tbl_m4_plan)
-            by_floor = {
-                floor: list(self.m4_entries_shared)
-                for floor in self.m4_selected_floors
-                if self.m4_entries_shared
-            }
+        summary = info.get("summary")
+        if not isinstance(summary, QLabel):
+            return
+        entries = self.m4_overrides.get(floor) or self.m4_base_entries
+        if not entries:
+            summary.setText("未设置")
+            return
+        text = self._format_plan_summary(entries)
+        if floor in self.m4_overrides:
+            summary.setText(f"自定义：{text}")
         else:
-            if self._cur_m4_floor:
-                self.m4_entries_by_floor[self._cur_m4_floor] = self._plan_table_collect(self.tbl_m4_plan)
-            by_floor = {
-                floor: list(self.m4_entries_by_floor.get(floor, []))
-                for floor in self.m4_selected_floors
-                if self.m4_entries_by_floor.get(floor)
-            }
+            summary.setText(f"继承：{text}")
 
-        plan: dict[str, dict[str, list[tuple[str, int | None]]]] = {}
-        for cat in categories:
-            if by_floor:
-                plan[cat] = {floor: list(entries) for floor, entries in by_floor.items()}
-
-        return plan
-
-    def _apply_detection_to_mode4_ui(self):
-        if not hasattr(self, "m4_floor_chips"):
-            return
-        gz_ok = self.present.get("钢柱", False)
-        gl_ok = self.present.get("钢梁", False)
-        sup_ok = self.present.get("支撑", False)
-        net_ok = self.present.get("网架", False)
-
-        for ok, widget in (
-            (gz_ok, self.sw_m4_cat_gz),
-            (gl_ok, self.sw_m4_cat_gl),
-            (sup_ok, self.sw_m4_cat_sup),
-            (net_ok, self.sw_m4_cat_net),
-        ):
-            widget.setVisible(ok)
-            widget.setEnabled(ok)
-            if ok and not widget.isChecked():
-                widget.setChecked(True)
-            if not ok:
-                widget.setChecked(False)
-
-        self.ck_m4_support.setVisible(sup_ok)
-        if not sup_ok:
-            self.ck_m4_support.setChecked(False)
-        self.lb_m4_sup_strategy.setVisible(sup_ok)
-        self.cmb_m4_sup_strategy.setVisible(sup_ok)
-        sup_enabled = sup_ok and self.ck_m4_support.isChecked()
-        self.lb_m4_sup_strategy.setEnabled(sup_enabled)
-        self.cmb_m4_sup_strategy.setEnabled(sup_enabled)
-        self.sw_m4_cat_sup.setEnabled(sup_enabled)
-        if not sup_enabled:
-            self.sw_m4_cat_sup.setChecked(False)
-
-        self.lb_m4_net_strategy.setVisible(net_ok)
-        self.cmb_m4_net_strategy.setVisible(net_ok)
-        self.sw_m4_cat_net.setVisible(net_ok)
-        if not net_ok:
-            self.sw_m4_cat_net.setChecked(False)
-
-        active_cats = gz_ok or gl_ok or sup_ok or net_ok
-        self.box_m4.setDisabled(not active_cats)
-
-        sorter = _floor_sort_key_by_label or (lambda x: x)
-        floors_set: set[str] = set()
-        for cat in ("钢柱", "钢梁", "支撑", "网架"):
-            floors_set.update(self._floors_by_cat.get(cat, set()))
-        floors = sorted(floors_set, key=sorter)
-        self.m4_all_floors = floors
-        self._rebuild_m4_floor_chips(floors)
-        if self.m4_selected_floors:
-            selected = self.m4_selected_floors & set(floors)
-            if not selected and floors:
-                selected = set(floors)
-        else:
-            selected = set(floors)
-        self._m4_set_selected_floors(selected)
-
-        has_floors = bool(floors)
-        for btn in (
-            self.btn_m4_floor_all,
-            self.btn_m4_floor_none,
-            self.btn_m4_floor_base,
-            self.btn_m4_floor_std,
-        ):
-            btn.setEnabled(has_floors)
-
-    def _update_m4_floor_hint(self):
-        if not hasattr(self, "lb_m4_floors"):
-            return
-        if not self._floors_by_cat:
-            self.lb_m4_floors.setText("（楼层信息将在读取后显示）")
-            return
+    def _format_plan_summary(self, entries: list[tuple[str, int]]) -> str:
         parts = []
-        sorter = _floor_sort_key_by_label or (lambda x: x)
-        for cat in ("钢柱", "钢梁", "支撑", "网架"):
-            floors = sorted(self._floors_by_cat.get(cat, []), key=sorter)
-            if floors:
-                parts.append(f"{cat}：{' '.join(floors)}")
-        self.lb_m4_floors.setText(" | ".join(parts))
+        for date, limit in entries:
+            if self.m4_strategy == "even":
+                parts.append(f"{date}(均分)")
+            else:
+                parts.append(f"{date}({limit if limit > 0 else '不限'})")
+        return "，".join(parts)
 
-    def _on_m4_support_toggled(self, checked: bool):
-        if not hasattr(self, "sw_m4_cat_sup"):
+    def _on_floor_customize_toggled(self, floor: str, checked: bool):
+        info = self.m4_floor_rows.get(floor)
+        if not info:
             return
-        sup_ok = self.present.get("支撑", False)
-        enabled = checked and sup_ok
-        self.lb_m4_sup_strategy.setEnabled(enabled)
-        self.cmb_m4_sup_strategy.setEnabled(enabled)
-        self.sw_m4_cat_sup.setEnabled(enabled)
-        if not enabled:
-            self.sw_m4_cat_sup.setChecked(False)
-        elif enabled and not self.sw_m4_cat_sup.isChecked():
-            self.sw_m4_cat_sup.setChecked(True)
+        editor = info.get("editor")
+        toggle = info.get("toggle")
+        table = info.get("table")
+        if isinstance(toggle, QToolButton):
+            toggle.setText("收起" if checked else "自定义")
+        if isinstance(editor, QWidget):
+            editor.setVisible(checked)
+        if not isinstance(table, QTableWidget):
+            return
+        if checked:
+            entries = self.m4_overrides.get(floor) or (self.m4_base_entries if self.m4_base_entries else [])
+            self._plan_table_set_entries(table, entries, suppress_trigger=True)
+            self._trigger_plan_change(table)
+        else:
+            self._plan_table_set_entries(table, [], suppress_trigger=True)
+            self.m4_overrides.pop(floor, None)
+            self._trigger_plan_change(table)
+        self._update_floor_summary(floor)
 
-    def _on_m4_fallback_changed(self, idx: int):
+    def _on_floor_plan_changed(self, floor: str):
+        info = self.m4_floor_rows.get(floor)
+        if not info:
+            return
+        table = info.get("table")
+        if not isinstance(table, QTableWidget):
+            return
+        entries = self._plan_table_collect(table)
+        if entries and entries != self.m4_base_entries:
+            self.m4_overrides[floor] = entries
+        else:
+            self.m4_overrides.pop(floor, None)
+        self._update_floor_summary(floor)
+        self._refresh_m4_preview()
+
+    def _on_base_plan_changed(self):
+        if not hasattr(self, "tbl_m4_base"):
+            return
+        self.m4_base_entries = self._plan_table_collect(self.tbl_m4_base)
+        for floor in self.m4_applied_floors:
+            if floor not in self.m4_overrides:
+                self._update_floor_summary(floor)
+        self._refresh_m4_strategy_ui()
+        self._refresh_m4_preview()
+
+    def _on_default_plan_changed(self):
+        self._refresh_m4_preview()
+
+    def _on_apply_plan_clicked(self):
+        if not self.m4_selected_floors:
+            QMessageBox.warning(self, "提示", "请至少选择一个楼层。")
+            return
+        base_entries = self._plan_table_collect(self.tbl_m4_base)
+        if not base_entries:
+            QMessageBox.warning(self, "提示", "请先在上方设置日期计划。")
+            return
+        self.m4_base_entries = base_entries
+        self.m4_applied_floors = set(self.m4_selected_floors)
+        for floor in list(self.m4_overrides.keys()):
+            if floor not in self.m4_applied_floors:
+                self.m4_overrides.pop(floor, None)
+        self._sync_m4_applied_rows()
+        self._refresh_m4_preview()
+
+    def _on_m4_strategy_changed(self, mode: str):
+        if mode not in {"even", "quota"}:
+            return
+        if self.m4_strategy == mode:
+            return
+        self.m4_strategy = mode
+        self.settings.setValue("mode4/strategy", mode)
+        self._refresh_m4_strategy_ui()
+        self._refresh_m4_preview()
+
+    def _refresh_m4_strategy_ui(self):
+        is_quota = self.m4_strategy == "quota"
+        if hasattr(self, "lb_m4_base_hint"):
+            if is_quota:
+                self.lb_m4_base_hint.setText("配额：填入每日上限；最后一天自动吃掉余量。")
+            else:
+                self.lb_m4_base_hint.setText("均分：系统按天平均分配，最后一天自动吃掉余量。")
+        tables: list[QTableWidget] = []
+        if hasattr(self, "tbl_m4_base"):
+            tables.append(self.tbl_m4_base)
+        if hasattr(self, "tbl_m4_default"):
+            tables.append(self.tbl_m4_default)
+        tables += [info.get("table") for info in self.m4_floor_rows.values()]
+        for table in tables:
+            if isinstance(table, QTableWidget):
+                table.setColumnHidden(1, not is_quota)
+        self._refresh_m4_summary_label()
+
+    def _refresh_m4_default_visibility(self):
         if not hasattr(self, "w_m4_default"):
             return
-        show = idx == 1
+        show = self.m4_fallback == "default"
         self.w_m4_default.setVisible(show)
         if show and hasattr(self, "tbl_m4_default") and self.tbl_m4_default.rowCount() == 0:
             self._plan_table_add_row(self.tbl_m4_default)
 
+    def _on_m4_fallback_changed(self):
+        prev = self.m4_fallback
+        if hasattr(self, "rb_m4_fb_default") and self.rb_m4_fb_default.isChecked():
+            self.m4_fallback = "default"
+        elif hasattr(self, "rb_m4_fb_error") and self.rb_m4_fb_error.isChecked():
+            self.m4_fallback = "error"
+        else:
+            self.m4_fallback = "append_last"
+        if prev != self.m4_fallback:
+            self.settings.setValue("mode4/fallback", self.m4_fallback)
+        self._refresh_m4_default_visibility()
+        self._refresh_m4_preview()
 
-    # ====== 返回 Step1 重选文件 ======
-    def _go_back_to_select(self):
-        self.stack.setCurrentIndex(0)
-        self.status.setText("准备就绪")
-
-    # ====== Mode 1：日期分桶 ======
-    def _collect_mode1_buckets(self) -> list[dict]:
-        buckets: list[dict] = []
-        if not self._m1_day_forms:
-            return buckets
-
-        for form in self._m1_day_forms:
-            date_str = form["date"].text().strip()
-            parts: dict[str, object] = {}
-
-            if "钢柱" in form:
-                parts["钢柱"] = self._to_rule(form["钢柱"].text())
-            if "钢梁" in form:
-                parts["钢梁"] = self._to_rule(form["钢梁"].text())
-            if "支撑" in form:
-                parts["支撑"] = self._to_rule(form["支撑"].text())
-            if "网架_xx" in form:
-                parts["网架"] = {
-                    "XX": self._to_rule(form["网架_xx"].text()),
-                    "FG": self._to_rule(form["网架_fg"].text()),
-                    "SX": self._to_rule(form["网架_sx"].text()),
-                    "GEN": self._to_rule(form["网架_gen"].text()),
-                }
-
-            buckets.append({"date": date_str, "rules": parts})
-
-        return buckets
-
-    def _on_run_mode1(self):
-        if not export_mode1_noninteractive:
-            QMessageBox.critical(self, "提示", "后端暂不支持 Mode 1 生成接口。")
+    def _on_support_strategy_changed(self):
+        if not hasattr(self, "cmb_m4_sup_strategy"):
             return
-        if not self.doc_path:
-            QMessageBox.warning(self, "提示", "请先选择 Word 源文件。")
+        self.m4_support_strategy = "floor" if self.cmb_m4_sup_strategy.currentIndex() == 1 else "number"
+        self.settings.setValue("mode4/supportStrategy", self.m4_support_strategy)
+        self._refresh_m4_preview()
+
+    def _on_net_strategy_changed(self):
+        if not hasattr(self, "cmb_m4_net_strategy"):
             return
+        self.m4_net_strategy = "floor" if self.cmb_m4_net_strategy.currentIndex() == 1 else "number"
+        self.settings.setValue("mode4/netStrategy", self.m4_net_strategy)
+        self._refresh_m4_preview()
 
-        buckets = self._collect_mode1_buckets()
-        if not buckets:
-            QMessageBox.warning(self, "提示", "请至少填写一天数据。")
+    def _on_m4_support_toggled(self, checked: bool):
+        sup_ok = self.present.get("支撑", False)
+        self.m4_include_support = checked and sup_ok
+        self.settings.setValue("mode4/includeSupport", self.m4_include_support)
+        if hasattr(self, "lb_m4_sup_strategy"):
+            self.lb_m4_sup_strategy.setVisible(sup_ok)
+            self.cmb_m4_sup_strategy.setVisible(sup_ok)
+            self.lb_m4_sup_strategy.setEnabled(self.m4_include_support)
+            self.cmb_m4_sup_strategy.setEnabled(self.m4_include_support)
+        if hasattr(self, "sw_m4_cat_sup") and sup_ok:
+            self.sw_m4_cat_sup.setEnabled(self.m4_include_support)
+            if not self.m4_include_support:
+                self.sw_m4_cat_sup.setChecked(False)
+            elif not self.sw_m4_cat_sup.isChecked():
+                self.sw_m4_cat_sup.setChecked(True)
+        self._refresh_m4_preview()
+
+    def _on_m4_write_dates_changed(self, checked: bool):
+        self.m4_write_dates = bool(checked)
+        self.settings.setValue("mode4/writeDates", self.m4_write_dates)
+
+    def _on_categories_changed(self):
+        self._refresh_m4_summary_label()
+        self._refresh_m4_preview()
+
+    def _current_categories(self) -> list[str]:
+        cats: list[str] = []
+        mapping = [
+            ("钢柱", getattr(self, "sw_m4_cat_gz", None)),
+            ("钢梁", getattr(self, "sw_m4_cat_gl", None)),
+            ("支撑", getattr(self, "sw_m4_cat_sup", None)),
+            ("网架", getattr(self, "sw_m4_cat_net", None)),
+        ]
+        for name, widget in mapping:
+            if isinstance(widget, QCheckBox) and widget.isVisible() and widget.isEnabled() and widget.isChecked():
+                cats.append(name)
+        if not self.m4_include_support and "支撑" in cats:
+            cats.remove("支撑")
+        return cats
+
+    def _convert_entries_for_strategy(self, entries: list[tuple[str, int]]) -> list[tuple[str, int | None]]:
+        if self.m4_strategy == "even":
+            return [(date, None) for date, _ in entries]
+        return [(date, int(limit)) for date, limit in entries]
+
+    def _collect_m4_plan_from_ui(self) -> dict:
+        categories = self._current_categories()
+        if not categories or not self.m4_applied_floors:
+            return {}
+        base_entries = self.m4_base_entries or self._plan_table_collect(self.tbl_m4_base)
+        if not base_entries:
+            return {}
+        plan_base = self._convert_entries_for_strategy(base_entries)
+        plan: dict[str, dict[str, list[tuple[str, int | None]]]] = {}
+        for cat in categories:
+            plan[cat] = {}
+            for floor in sorted(self.m4_applied_floors):
+                override = self.m4_overrides.get(floor)
+                if override:
+                    plan[cat][floor] = self._convert_entries_for_strategy(override)
+                else:
+                    plan[cat][floor] = list(plan_base)
+        return plan
+
+    def _refresh_m4_summary_label(self):
+        if not hasattr(self, "lb_m4_summary"):
             return
+        cat_count = len(self._current_categories())
+        floor_count = len(self.m4_applied_floors)
+        if not cat_count or not floor_count:
+            self.lb_m4_summary.setText("尚未应用楼层计划")
+        else:
+            self.lb_m4_summary.setText(f"将应用到 {floor_count} 个楼层，涵盖 {cat_count} 类")
 
-        def _has_content(bucket: dict) -> bool:
-            if bucket.get("date"):
-                return True
-            rules = bucket.get("rules") or bucket.get("parts") or {}
-            for key, value in rules.items():
-                if key == "网架":
-                    if any(part.get("enabled") for part in value.values()):
-                        return True
-                elif value.get("enabled"):
-                    return True
-            return False
-
-        if not any(_has_content(b) for b in buckets):
-            QMessageBox.warning(self, "提示", "请至少填写一天数据。")
-            return
-
-        support_strategy = "floor" if self.cmb_m1_sup.isVisible() and self.cmb_m1_sup.currentIndex() == 1 else "number"
-        net_strategy = "floor" if self.cmb_m1_net.isVisible() and self.cmb_m1_net.currentIndex() == 1 else "number"
-        later_priority = self.ck_m1_later.isChecked()
-        auto_merge_rest = self.ck_m1_merge.isChecked()
-
-        self.status.setText("⏳ 正在生成（Mode 1 / 日期分桶）…")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+    def _simulate_distribution(self, items, plan_entries):
+        if not _distribute_by_dates:
+            return []
         try:
-            xlsx, word = export_mode1_noninteractive(
-                src_docx=str(self.doc_path),
-                buckets=buckets,
-                support_strategy=support_strategy,
-                net_strategy=net_strategy,
-                later_priority=later_priority,
-                auto_merge_rest=auto_merge_rest,
-                meta={},
-            )
-            QMessageBox.information(self, "完成", f"✅ 生成完成！\nExcel：{xlsx}\n汇总Word：{word}")
-            self.status.setText("✅ 日期分桶完成")
-        except Exception as e:
-            QMessageBox.critical(self, "失败", f"生成失败：\n{e}")
-            self.status.setText("❌ 生成失败")
-        finally:
-            QApplication.restoreOverrideCursor()
+            return _distribute_by_dates(items, plan_entries)
+        except Exception:
+            return []
 
-
+    def _refresh_m4_preview(self):
+        if not hasattr(self, "lb_m4_preview"):
+            return
+        plan = self._collect_m4_plan_from_ui()
+        if not plan:
+            self.lb_m4_preview.setText("请先设计划并应用到楼层。")
+            self._refresh_m4_summary_label()
+            return
+        summary_by_date: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        leftover: dict[str, int] = defaultdict(int)
+        for (cat, floor), items in self._cf_groups_by_floor.items():
+            if cat not in plan:
+                continue
+            plan_for_floor = plan[cat].get(floor)
+            if not plan_for_floor:
+                leftover[cat] += len(items)
+                continue
+            distribution = self._simulate_distribution(list(items), plan_for_floor)
+            assigned = 0
+            for date, slice_items in distribution:
+                assigned += len(slice_items)
+                summary_by_date[date][cat] += len(slice_items)
+            if len(items) > assigned:
+                leftover[cat] += len(items) - assigned
+        if not summary_by_date:
+            self.lb_m4_preview.setText("暂无可分配的构件。")
+        else:
+            def _date_key(value: str):
+                qd = QDate.fromString(value, "yyyy-M-d")
+                return qd.toJulianDay() if qd.isValid() else value
+            lines: list[str] = []
+            for idx, date in enumerate(sorted(summary_by_date.keys(), key=_date_key)):
+                cats_line = "｜".join(f"{cat}{cnt}组" for cat, cnt in summary_by_date[date].items() if cnt)
+                if not cats_line:
+                    cats_line = "无任务"
+                lines.append(f"第{idx + 1}天（{date}）：{cats_line}")
+            left_total = sum(leftover.values())
+            if left_total:
+                parts = [f"{cat}{cnt}组" for cat, cnt in leftover.items() if cnt]
+                policy = {
+                    "append_last": "（生成时并入最后一天）",
+                    "default": "（生成时使用默认计划）",
+                    "error": "（生成时会终止提示）",
+                }.get(self.m4_fallback, "")
+                lines.append(f"未分配：{left_total}组（{'、'.join(parts)}）{policy}")
+            self.lb_m4_preview.setText("\n".join(lines))
+        self._refresh_m4_summary_label()
 
     def _on_run_mode4(self):
         if not export_mode4_noninteractive:
@@ -1547,29 +1723,22 @@ class MainWindow(QMainWindow):
 
         plan = self._collect_m4_plan_from_ui()
         if not plan:
-            QMessageBox.warning(self, "提示", "请至少为一个类别填写计划。")
+            QMessageBox.warning(self, "提示", "请先完成计划并应用到楼层。")
             return
 
-        sup_strategy = "number"
-        if self.lb_m4_sup_strategy.isVisible() and self.cmb_m4_sup_strategy.currentIndex() == 1:
-            sup_strategy = "floor"
-        net_strategy = "number"
-        if self.lb_m4_net_strategy.isVisible() and self.cmb_m4_net_strategy.currentIndex() == 1:
-            net_strategy = "floor"
-
-        fb_map = {0: "append_last", 1: "default", 2: "error"}
-        fallback = fb_map.get(self.cmb_m4_fallback.currentIndex(), "append_last")
+        sup_strategy = self.m4_support_strategy
+        net_strategy = self.m4_net_strategy
+        fallback = self.m4_fallback
 
         default_entries = None
         if fallback == "default":
-            default_entries = self._plan_table_collect(self.tbl_m4_default)
-            if not default_entries:
-                QMessageBox.warning(self, "提示", "请填写默认计划的日期与上限。")
+            raw_default = self._plan_table_collect(self.tbl_m4_default)
+            if not raw_default:
+                QMessageBox.warning(self, "提示", "请填写未分配时使用的默认计划。")
                 return
+            default_entries = self._convert_entries_for_strategy(raw_default)
 
-        include_support = (
-                self.ck_m4_support.isVisible() and self.ck_m4_support.isEnabled() and self.ck_m4_support.isChecked()
-        )
+        include_support = self.m4_include_support
 
         self.status.setText("⏳ 正在生成（Mode 4）…")
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -1583,11 +1752,20 @@ class MainWindow(QMainWindow):
                 net_strategy=net_strategy,
                 fallback=fallback,
                 default_entries=default_entries,
+                write_dates_to_header=self.m4_write_dates,
             )
-            QMessageBox.information(self, "完成", f"✅ 生成完成！\nExcel：{xlsx}\n汇总Word：{word}")
+            QMessageBox.information(
+                self,
+                "完成",
+                f"✅ 生成完成！\nExcel：{xlsx}\n汇总Word：{word}",
+            )
             self.status.setText("✅ Mode 4 完成")
         except Exception as e:
-            QMessageBox.critical(self, "失败", f"生成失败：\n{e}")
+            QMessageBox.critical(
+                self,
+                "失败",
+                f"生成失败：\n{e}",
+            )
             self.status.setText("❌ 生成失败")
         finally:
             QApplication.restoreOverrideCursor()
