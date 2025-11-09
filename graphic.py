@@ -18,8 +18,6 @@ from PySide6.QtWidgets import (
     QCheckBox, QMessageBox, QSpacerItem, QSizePolicy, QStackedWidget, QFrame,
     QComboBox, QScrollArea, QSpinBox, QPlainTextEdit
 )
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QGraphicsDropShadowEffect
 
 
 # ========= ORF 自搜索导入块 =========
@@ -171,7 +169,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.stack)
 
         self._apply_styles()
-
 
     # ====== Page 1：仅路径 ======
     def _build_page_select(self) -> QWidget:
