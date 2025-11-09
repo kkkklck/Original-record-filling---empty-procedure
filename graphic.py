@@ -11,7 +11,7 @@ import os, sys, importlib.util, re, copy
 from pathlib import Path
 from dataclasses import dataclass
 import unicodedata
-from PySide6.QtCore import Qt, QSize, QThread, Signal
+from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings
 from PySide6.QtGui import QIcon, QPixmap, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QLineEdit, QPushButton,
@@ -155,7 +155,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{BACKEND_TITLE} · 图形界面")
         self.resize(1100, 700)
 
-        self.accent = "#2d89ef"  # 默认蓝
+        self.settings = QSettings("ORF", "OriginalRecordFilling")  # 组织, 应用名
+
         self._theme_options = [
             ("蓝色", "#2d89ef"),
             ("绿色", "#34c759"),
@@ -164,6 +165,8 @@ class MainWindow(QMainWindow):
             ("橙色", "#ff9500"),
             ("紫色", "#7e57c2"),
         ]
+
+        self.accent = self.settings.value("ui/themeColor", "#2d89ef", type=str)
 
         self.doc_path: Path | None = None
         self.present = {k: False for k in CANON_KEYS}
@@ -204,7 +207,9 @@ class MainWindow(QMainWindow):
             pm.fill(QColor(hx))
             self.cmb_theme.addItem(QIcon(pm), name, hx)
 
-        self.cmb_theme.setCurrentIndex(0)  # 默认蓝
+        curr = (self.accent or "").lower()
+        idx = next((i for i, (_, hx) in enumerate(self._theme_options) if hx.lower() == curr), 0)
+        self.cmb_theme.setCurrentIndex(idx)
         row_theme.addWidget(self.cmb_theme)
         row_theme.addStretch(1)
         b.addLayout(row_theme)
@@ -521,6 +526,8 @@ class MainWindow(QMainWindow):
         if isinstance(hx, str) and hx.startswith("#"):
             self.accent = hx
             self._apply_styles()  # 重新套样式
+            self.settings.setValue("ui/themeColor", self.accent)
+            self.settings.sync()
 
     def _apply_styles(self):
         c = self.accent
@@ -561,6 +568,11 @@ class MainWindow(QMainWindow):
                     image: none; background:{c}; border:2px solid {c};
                 }}
         """)
+
+    def closeEvent(self, e):
+        self.settings.setValue("ui/themeColor", self.accent)
+        self.settings.sync()
+        super().closeEvent(e)
 
     # ====== Step1：选择并静默检索 ======
     def _on_browse_and_probe(self):
