@@ -1357,6 +1357,8 @@ class MainWindow(QMainWindow):
             self.m4_selected_floors.discard(name)
 
     def _create_floor_row(self, floor: str) -> QFrame:
+        name = floor
+
         frame = QFrame()
         frame.setFrameShape(QFrame.StyledPanel)
         frame_lay = QVBoxLayout(frame)
@@ -1382,7 +1384,7 @@ class MainWindow(QMainWindow):
         editor_lay.setContentsMargins(0, 0, 0, 0)
         editor_lay.setSpacing(6)
         table = QTableWidget()
-        self._init_plan_table(table, on_change=lambda floor=floor: self._on_floor_plan_changed(floor))
+        self._init_plan_table(table, on_change=lambda floor=name: self._on_floor_plan_changed(floor))
         editor_lay.addWidget(table)
         btn_row = QHBoxLayout()
         btn_add = QPushButton("+ 添加日期")
@@ -1398,9 +1400,9 @@ class MainWindow(QMainWindow):
         btn_add.clicked.connect(lambda _, tbl=table: self._plan_table_add_row(tbl))
         btn_copy.clicked.connect(lambda _, tbl=table: self._plan_table_copy_last(tbl))
         btn_del.clicked.connect(lambda _, tbl=table: self._plan_table_remove_selected(tbl))
-        toggle.toggled.connect(lambda checked, floor=floor: self._on_floor_customize_toggled(floor, checked))
+        toggle.toggled.connect(partial(self._on_floor_customize_toggled, name))
 
-        self.m4_floor_rows[floor] = {
+        self.m4_floor_rows[name] = {
             "frame": frame,
             "summary": summary,
             "toggle": toggle,
@@ -1453,8 +1455,8 @@ class MainWindow(QMainWindow):
                 parts.append(f"{date}({limit if limit > 0 else '不限'})")
         return "，".join(parts)
 
-    def _on_floor_customize_toggled(self, floor: str, checked: bool):
-        info = self.m4_floor_rows.get(floor)
+    def _on_floor_customize_toggled(self, name: str, checked: bool):
+        info = self.m4_floor_rows.get(name)
         if not info:
             return
         editor = info.get("editor")
@@ -1467,14 +1469,14 @@ class MainWindow(QMainWindow):
         if not isinstance(table, QTableWidget):
             return
         if checked:
-            entries = self.m4_overrides.get(floor) or (self.m4_base_entries if self.m4_base_entries else [])
+            entries = self.m4_overrides.get(name) or (self.m4_base_entries if self.m4_base_entries else [])
             self._plan_table_set_entries(table, entries, suppress_trigger=True)
             self._trigger_plan_change(table)
         else:
             self._plan_table_set_entries(table, [], suppress_trigger=True)
-            self.m4_overrides.pop(floor, None)
+            self.m4_overrides.pop(name, None)
             self._trigger_plan_change(table)
-        self._update_floor_summary(floor)
+        self._update_floor_summary(name)
 
     def _on_floor_plan_changed(self, floor: str):
         info = self.m4_floor_rows.get(floor)
