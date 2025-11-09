@@ -2572,11 +2572,18 @@ def _distribute_by_dates(items, date_entries):
     if date_entries[0][1] is not None:  # 配额模式
         cursor = 0
         total = len(items)
+        n = len(date_entries)
         for i, (d, limit) in enumerate(date_entries):
-            if i < len(date_entries) - 1:
-                take = min(limit, total - cursor)
+            remaining = max(0, total - cursor)
+            if remaining <= 0:
+                res.append((d, []))
+                continue
+            if limit is None or limit <= 0:
+                take = remaining
+            elif i < n - 1:
+                take = min(int(limit), remaining)
             else:
-                take = total - cursor
+                take = remaining
             res.append((d, items[cursor:cursor + take]))
             cursor += take
     else:  # 均分
@@ -2725,6 +2732,7 @@ def prompt_mode4_plan(floors_by_cat, categories_present):
 
 def mode4_run(wb, grouped, categories_present):
     """执行模式4：按楼层和日期写入Excel。"""
+    write_dates = bool(globals().get("NONINTERACTIVE_MODE4_WRITE_DATES", True))
     injected_support = (globals().get("NONINTERACTIVE_MODE4_SUPPORT_STRATEGY") or "").lower()
     if injected_support in {"number", "floor"}:
         set_support_strategy(injected_support)
@@ -2879,11 +2887,12 @@ def mode4_run(wb, grouped, categories_present):
             blocks = blocks_by_cat_bucket[cat].get(i, [])
             fill_blocks_to_pages(wb, pages, blocks, prog)
             day_pages += pages
-        apply_meta_on_pages(
-            wb,
-            day_pages,
-            normalize_date(buckets[i]["date"]),
-        )
+        if write_dates:
+            apply_meta_on_pages(
+                wb,
+                day_pages,
+                normalize_date(buckets[i]["date"]),
+            )
     prog.finish()
 
     used_names_total = target
@@ -3678,6 +3687,7 @@ def export_mode4_noninteractive(
         net_strategy: str = "number",
         fallback: str = "append_last",
         default_entries: list[tuple[str, int | None]] | None = None,
+        write_dates_to_header: bool = True,
 ) -> tuple[Path, Path | None]:
     """无交互导出 Mode4。"""
 
@@ -3722,6 +3732,7 @@ def export_mode4_noninteractive(
     globals()["NONINTERACTIVE_MODE4_DEFAULT"] = _norm_entry_list(default_entries or [])
     globals()["NONINTERACTIVE_MODE4_SUPPORT_STRATEGY"] = sup_val
     globals()["NONINTERACTIVE_MODE4_NET_STRATEGY"] = net_val
+    globals()["NONINTERACTIVE_MODE4_WRITE_DATES"] = bool(write_dates_to_header)
 
     try:
         used_pages = run_mode("4", wb, grouped, categories_present)
@@ -3765,6 +3776,7 @@ def export_mode4_noninteractive(
                 "NONINTERACTIVE_MODE4_DEFAULT",
                 "NONINTERACTIVE_MODE4_SUPPORT_STRATEGY",
                 "NONINTERACTIVE_MODE4_NET_STRATEGY",
+                "NONINTERACTIVE_MODE4_WRITE_DATES",
         ):
             globals().pop(key, None)
 
