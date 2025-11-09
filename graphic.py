@@ -732,7 +732,10 @@ class MainWindow(QMainWindow):
         lm4.addWidget(preview_box, 2)
 
 # 容器：只显示当前模式对应的表单
-        self.panel_wrap = QVBoxLayout()
+        self.panel_host = QWidget()
+        self.panel_wrap = QVBoxLayout(self.panel_host)
+        self.panel_wrap.setContentsMargins(0, 0, 0, 0)
+        self.panel_wrap.setSpacing(8)
         self.panel_wrap.addWidget(self.box_m1)
         self.panel_wrap.addWidget(self.box_m2)  # 默认显示 M2
         self.panel_wrap.addWidget(self.box_m3)
@@ -741,7 +744,7 @@ class MainWindow(QMainWindow):
         self.box_m3.setVisible(False)
         self.box_m4.setVisible(False)
 
-        lay.addLayout(self.panel_wrap)
+        lay.addWidget(self.panel_host)
         lay.addStretch(1)
 
 
