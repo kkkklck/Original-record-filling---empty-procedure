@@ -54,21 +54,49 @@ def _load_orf_module():
             return mod
     raise ModuleNotFoundError("未找到 ORF.py（已在常见位置搜索）。")
 
-_ORF = _load_orf_module()
-probe_categories_from_docx = _ORF.probe_categories_from_docx
-export_mode2_noninteractive = _ORF.export_mode2_noninteractive
-run_noninteractive = _ORF.run_noninteractive
-Mode1ConfigProvider = getattr(_ORF, "Mode1ConfigProvider", None)
-run_mode1_with_provider = getattr(_ORF, "run_mode1_with_provider", None)
-export_mode1_noninteractive = getattr(_ORF, "export_mode1_noninteractive", None)
-export_mode4_noninteractive = getattr(_ORF, "export_mode4_noninteractive", None)
-prepare_from_word = getattr(_ORF, "prepare_from_word", None)
-_distribute_by_dates = getattr(_ORF, "_distribute_by_dates", None)
-normalize_date = getattr(_ORF, "normalize_date", lambda x: x)
-_floor_label_from_name = getattr(_ORF, "_floor_label_from_name", None)
-_floor_sort_key_by_label = getattr(_ORF, "_floor_sort_key_by_label", None)
-BACKEND_TITLE = getattr(_ORF, "TITLE", "原始记录自动填写程序")
-ORF_LOADED_FROM = getattr(_ORF, "__file__", None)
+# —— 懒加载 ORF：用到时才导入，避免阻塞 UI 启动 ——
+_ORF = None
+probe_categories_from_docx = None
+export_mode2_noninteractive = None
+run_noninteractive = None
+Mode1ConfigProvider = None
+run_mode1_with_provider = None
+export_mode1_noninteractive = None
+export_mode4_noninteractive = None
+prepare_from_word = None
+_distribute_by_dates = None
+normalize_date = lambda x: x
+_floor_label_from_name = None
+_floor_sort_key_by_label = None
+BACKEND_TITLE = "原始记录自动填写程序"
+ORF_LOADED_FROM = None
+
+def _ensure_backend_loaded():
+    global _ORF, probe_categories_from_docx, export_mode2_noninteractive, run_noninteractive
+    global Mode1ConfigProvider, run_mode1_with_provider, export_mode1_noninteractive
+    global export_mode4_noninteractive, prepare_from_word, _distribute_by_dates
+    global normalize_date, _floor_label_from_name, _floor_sort_key_by_label
+    global BACKEND_TITLE, ORF_LOADED_FROM
+
+    if _ORF is not None:
+        return
+    mod = _load_orf_module()
+    _ORF = mod
+    probe_categories_from_docx = getattr(mod, "probe_categories_from_docx", None)
+    export_mode2_noninteractive = getattr(mod, "export_mode2_noninteractive", None)
+    run_noninteractive = getattr(mod, "run_noninteractive", None)
+    Mode1ConfigProvider = getattr(mod, "Mode1ConfigProvider", None)
+    run_mode1_with_provider = getattr(mod, "run_mode1_with_provider", None)
+    export_mode1_noninteractive = getattr(mod, "export_mode1_noninteractive", None)
+    export_mode4_noninteractive = getattr(mod, "export_mode4_noninteractive", None)
+    prepare_from_word = getattr(mod, "prepare_from_word", None)
+    _distribute_by_dates = getattr(mod, "_distribute_by_dates", None)
+    normalize_date = getattr(mod, "normalize_date", lambda x: x)
+    _floor_label_from_name = getattr(mod, "_floor_label_from_name", None)
+    _floor_sort_key_by_label = getattr(mod, "_floor_sort_key_by_label", None)
+    BACKEND_TITLE = getattr(mod, "TITLE", BACKEND_TITLE)
+    ORF_LOADED_FROM = getattr(mod, "__file__", None)
+
 # ===================================
 
 DEFAULT_START_DIR = r"E:\pycharm first\pythonProject\原始记录自动填写程序\before"
@@ -312,7 +340,9 @@ class MainWindow(QMainWindow):
     # ====== Page 1：仅路径 ======
     def _build_page_select(self) -> QWidget:
         w = QWidget()
-        lay = QVBoxLayout(w); lay.setContentsMargins(16,16,16,16); lay.setSpacing(12)
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(12)
 
         box = QGroupBox("1. 选择 Word 源文件")
         b = QVBoxLayout(box)
@@ -353,21 +383,23 @@ class MainWindow(QMainWindow):
     # ====== Page 2：模式选择 + 表单 ======
     def _build_page_modes(self) -> QWidget:
         w = QWidget()
-        lay = QVBoxLayout(w); lay.setContentsMargins(16,16,16,16); lay.setSpacing(12)
+        layout_modes = QVBoxLayout(w)
+        layout_modes.setContentsMargins(16, 16, 16, 16)
+        layout_modes.setSpacing(12)
 
         header = QHBoxLayout()
         self.btn_back = QPushButton("← 返回选择文件"); self.btn_back.setFixedHeight(32)
         self.lb_file_short = QLabel(""); self.lb_file_short.setStyleSheet("color:#666;")
         header.addWidget(self.btn_back, 0); header.addSpacing(8); header.addWidget(self.lb_file_short, 1)
-        lay.addLayout(header)
-        lay.addWidget(hline())
+        layout_modes.addLayout(header)
+        layout_modes.addWidget(hline())
 
         # (A) 识别结果标签条（有什么就展示什么 + 数量）
         self.box_found = QGroupBox("识别结果")
         lf = QHBoxLayout(self.box_found)
         self.lb_found = QLabel("（空）"); self.lb_found.setStyleSheet("color:#555;")
         lf.addWidget(self.lb_found, 1)
-        lay.addWidget(self.box_found)
+        layout_modes.addWidget(self.box_found)
 
         # (B) 模式选择
         mode_box = QGroupBox("2. 选择处理模式")
@@ -382,7 +414,7 @@ class MainWindow(QMainWindow):
         for i, rb in enumerate([self.rb_m1, self.rb_m2, self.rb_m3, self.rb_m4], start=1):
             self.grp_mode.addButton(rb, i); lm.addWidget(rb)
         lm.addStretch(1)
-        lay.addWidget(mode_box)
+        layout_modes.addWidget(mode_box)
 
         # (C) Mode 1 表单
         self.box_m1 = QGroupBox("3A. Mode 1（日期分桶）")
@@ -732,10 +764,11 @@ class MainWindow(QMainWindow):
         lm4.addWidget(preview_box, 2)
 
 # 容器：只显示当前模式对应的表单
-        self.panel_host = QWidget()
-        self.panel_wrap = QVBoxLayout(self.panel_host)
+        self.panel_host = QWidget(w)
+        self.panel_wrap = QVBoxLayout()
         self.panel_wrap.setContentsMargins(0, 0, 0, 0)
         self.panel_wrap.setSpacing(8)
+        self.panel_host.setLayout(self.panel_wrap)
         self.panel_wrap.addWidget(self.box_m1)
         self.panel_wrap.addWidget(self.box_m2)  # 默认显示 M2
         self.panel_wrap.addWidget(self.box_m3)
@@ -744,14 +777,12 @@ class MainWindow(QMainWindow):
         self.box_m3.setVisible(False)
         self.box_m4.setVisible(False)
 
-        lay.addWidget(self.panel_host)
-        lay.addStretch(1)
+        layout_modes.addWidget(self.panel_host)
+        layout_modes.addStretch(1)
 
-
-
-        lay.addWidget(hline())
+        layout_modes.addWidget(hline())
         self.status = QLabel("准备就绪"); self.status.setStyleSheet("color:#555;")
-        lay.addWidget(self.status)
+        layout_modes.addWidget(self.status)
 
         # 事件
         self.btn_back.clicked.connect(self._go_back_to_select)
@@ -1864,3 +1895,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
