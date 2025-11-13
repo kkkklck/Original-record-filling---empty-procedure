@@ -1,10 +1,5 @@
 # graphic.py — 双页面向导式 GUI（PySide6）
-# Step 1: 仅路径 -> 自动静默检索 -> 进入 Step 2
-# Step 2: 显示“识别结果（带数量）”、选择 Mode，并只展开对应表单
-# 改动要点：
-#   - 新增：类别规范化映射，兼容“斜撑/桁架/Truss”等写法
-#   - 新增：顶部“识别结果”标签条（有什么就展示什么）
-#   - 改进：Mode2 的“可包含”行带数量，复选框采用蓝色勾选样式，更显眼
+
 
 from __future__ import annotations
 import os, sys, importlib.util, re, copy
@@ -221,6 +216,7 @@ class ProbeThread(QThread):
 
     def run(self):
         try:
+            _ensure_backend_loaded()
             info = probe_categories_from_docx(self.path)
             res = DocProbeResult(
                 categories=list(info.get("categories", [])),
@@ -1115,6 +1111,7 @@ class MainWindow(QMainWindow):
             self.ed_bp_net.setPlaceholderText("例：10 20 30（空=不分段）")
 
     def _ensure_floor_info(self):
+        _ensure_backend_loaded()
         if not hasattr(self, "lb_m4_floors"):
             return
         if self.doc_path is None or prepare_from_word is None:
@@ -1750,6 +1747,7 @@ class MainWindow(QMainWindow):
         self._refresh_m4_summary_label()
 
     def _on_run_mode4(self):
+        _ensure_backend_loaded()
         if not export_mode4_noninteractive:
             QMessageBox.critical(self, "提示", "后端暂不支持 Mode 4 生成接口。")
             return
@@ -1808,6 +1806,7 @@ class MainWindow(QMainWindow):
 
     # ====== 生成：Mode 3 ======
     def _on_run_mode3(self):
+        _ensure_backend_loaded()
         if not self.doc_path:
             QMessageBox.warning(self, "提示", "请先选择 Word 源文件。"); return
         dt = (self.ed_m3_date.text() or "").strip()
@@ -1827,6 +1826,7 @@ class MainWindow(QMainWindow):
 
     # ====== 生成：Mode 2 ======
     def _on_run_mode2(self):
+        _ensure_backend_loaded()
         if not self.doc_path:
             QMessageBox.warning(self, "提示", "请先选择 Word 源文件。");
             return
@@ -1895,4 +1895,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
